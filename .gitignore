@@ -1,0 +1,10 @@
+.pio/
+.vscode/
+CMakeLists.txt
+cmake_build/
+sdkconfig.lolin_s2_mini
+data/
+!src/
+!src/**
+!legacy/
+!legacy/**

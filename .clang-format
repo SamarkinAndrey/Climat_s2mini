@@ -1,0 +1,84 @@
+Language: Cpp
+BasedOnStyle: LLVM
+UseTab: Never
+IndentWidth: 2
+TabWidth: 2
+BreakBeforeBraces: Attach
+IndentCaseLabels: true
+ColumnLimit: 0
+AccessModifierOffset: -2
+AlignArrayOfStructures: Right
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'            
+}
+AlignConsecutiveBitFields: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'      
+}
+AlignConsecutiveDeclarations: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'
+}
+AlignConsecutiveMacros: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'
+}
+AlignConsecutiveShortCaseStatements: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'true'
+  AcrossComments: 'true'
+  AlignCaseColons: 'false'                          
+}
+AlignConsecutiveTableGenBreakingDAGArgColons: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'
+}
+AlignConsecutiveTableGenCondOperatorColons: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'
+}
+AlignConsecutiveTableGenDefinitionColons: {
+  Enabled: 'true'
+  AcrossEmptyLines: 'false'
+  AcrossComments: 'true'
+}
+AlignEscapedNewlines: LeftWithLastLine
+AlignOperands: Align
+AlignTrailingComments: {
+  Kind: 'Always'
+  OverEmptyLines: '2'     
+}
+AllowShortBlocksOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortEnumsOnASingleLine: false
+EmptyLineAfterAccessModifier: Never
+EmptyLineBeforeAccessModifier: Always
+KeepEmptyLines: {
+  AtEndOfFile: 'false'
+  AtStartOfBlock: 'false'
+  AtStartOfFile: 'false'
+}
+MaxEmptyLinesToKeep: 1
+RemoveEmptyLinesInUnwrappedLines: true
+SeparateDefinitionBlocks: Always
+SpacesBeforeTrailingComments: 1
+WrapNamespaceBodyWithEmptyLines: Always
+IndentPPDirectives: BeforeHash
+IndentRequiresClause: true
+InsertNewlineAtEOF: true
+NamespaceIndentation: All
+ObjCBinPackProtocolList: Never
+PPIndentWidth: 1
+QualifierAlignment: Left
+PointerAlignment: Right
+PointerAlignmentStyle: Right
+ReferenceAlignment: Right
+AlignCaseArrows: true

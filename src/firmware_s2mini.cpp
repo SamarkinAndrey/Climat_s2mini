@@ -511,7 +511,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 
   <div class="panel metric">
     <div class="mhead" onclick="toggleChart('h')">
-      <span class="mlabel">Влажность</span>
+      <span class="mlabel">Влажность<span class="status" id="s-dht"></span></span>
       <span class="mval" id="v-h">—</span>
       <span class="marrow" id="ar-h">▸</span>
     </div>

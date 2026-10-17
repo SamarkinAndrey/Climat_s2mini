@@ -418,7 +418,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 html,body{overflow-x:hidden}
 body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
 header{padding:10px 12px;background:var(--card);display:flex;flex-direction:column;gap:8px;width:100%}
-header h1{font-size:17px;font-weight:600;line-height:1.2}
+header h1{font-size:24px;font-weight:600;line-height:1.2}
 .badges{display:flex;gap:8px;flex-wrap:wrap;min-width:0}
 .badge{font-size:12px;padding:3px 10px;border-radius:999px;background:#334155;color:var(--mut);white-space:nowrap}
 nav{display:flex;gap:4px;padding:6px 10px;background:var(--card);border-bottom:1px solid #334155;overflow-x:auto;scrollbar-width:none;width:100%}
@@ -429,16 +429,24 @@ main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 .tab{display:none}.tab.active{display:block}
 .metric{padding:12px}
 .mhead{display:flex;align-items:baseline;gap:8px;cursor:pointer;-webkit-user-select:none;user-select:none}
-.mlabel{font-size:17px;color:var(--mut)}
+
+//.mlabel{font-size:21px;color:var(--mut)}
+.mlabel{font-size:21px;color:#fff}
 .mhead .status{font-size:12px;margin-left:6px}
 .mval{margin-left:auto;font-size:29px;font-weight:700;line-height:1.1;text-align:right}
-.mval .unit{font-size:13px;color:var(--mut);font-weight:400}
+#v-t{color:#f59e0b}
+#v-h{color:#38bdf8}
+#v-co2{color:#22c55e}
+//.metric:nth-child(1) .mlabel{color:#f59e0b}
+//.metric:nth-child(2) .mlabel{color:#38bdf8}
+//.metric:nth-child(3) .mlabel{color:#22c55e}
 .marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
 .mchart{margin-top:10px}
 .prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
 .prow label{color:var(--mut);font-size:14px;white-space:nowrap}
 .prow select,.prow input[type=number]{flex:1 1 auto;min-width:0;width:100%}
 .prow select{text-align:right;text-align-last:right;padding-right:34px}
+.prow > button.btn{margin-left:auto;margin-right:auto}
 .pbtns{justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
 input[type=number]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;text-align:right}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
@@ -464,7 +472,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
  .metric{padding:16px}
  .mlabel{font-size:19px}
  .mval{font-size:36px}
- .mval .unit{font-size:15px}
+ .mval .unit{font-size:18px}
  .mhead .status{font-size:13px}
  .panel{border-radius:16px;padding:18px;margin-bottom:16px}
  .panel h2{font-size:15px}
@@ -476,7 +484,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 </head>
 <body>
 <header>
-  <h1>🌿 Climat Monitor</h1>
+  <h1>🌿 Климат-монитор</h1>
   <div class="badges">
     <span class="badge" id="netBadge">—</span>
     <span class="badge" id="timeBadge">—</span>
@@ -494,8 +502,8 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 <div class="tab active" id="tab-live">
   <div class="panel metric">
     <div class="mhead" onclick="toggleChart('t')">
-      <span class="mlabel">Температура <span class="status" id="s-dht"></span></span>
-      <span class="mval" id="v-t">—<span class="unit"> °C</span></span>
+      <span class="mlabel">Температура<span class="status" id="s-dht"></span></span>
+      <span class="mval" id="v-t">—</span>
       <span class="marrow" id="ar-t">▸</span>
     </div>
     <div class="mchart" id="c-t" style="display:none"><canvas id="ch-t"></canvas></div>
@@ -504,7 +512,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
   <div class="panel metric">
     <div class="mhead" onclick="toggleChart('h')">
       <span class="mlabel">Влажность</span>
-      <span class="mval" id="v-h">—<span class="unit"> %</span></span>
+      <span class="mval" id="v-h">—</span>
       <span class="marrow" id="ar-h">▸</span>
     </div>
     <div class="mchart" id="c-h" style="display:none"><canvas id="ch-h"></canvas></div>
@@ -512,8 +520,8 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 
   <div class="panel metric">
     <div class="mhead" onclick="toggleChart('co2')">
-      <span class="mlabel">CO₂ <span class="status" id="s-mhz"></span></span>
-      <span class="mval" id="v-co2">—<span class="unit"> ppm</span></span>
+      <span class="mlabel">CO₂<span class="status" id="s-mhz"></span></span>
+      <span class="mval" id="v-co2">—</span>
       <span class="marrow" id="ar-co2">▸</span>
     </div>
     <div class="mchart" id="c-co2" style="display:none"><canvas id="ch-co2"></canvas></div>
@@ -530,7 +538,6 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
       </select>
     </div>
     <div class="prow pbtns">
-      <button class="btn sec" onclick="loadCharts()">Обновить</button>
       <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
     </div>
   </div>
@@ -633,9 +640,9 @@ saveUi();}
 
 // показатели главной вкладки: id canvas, цвет, подпись, поле данных
 const MET={
- t:{cv:'ch-t',box:'c-t',ar:'ar-t',color:'#f59e0b',label:'Температура, °C',field:'t'},
- h:{cv:'ch-h',box:'c-h',ar:'ar-h',color:'#38bdf8',label:'Влажность, %',field:'h'},
- co2:{cv:'ch-co2',box:'c-co2',ar:'ar-co2',color:'#22c55e',label:'CO₂, ppm',field:'co2'}
+ t:{cv:'ch-t',box:'c-t',ar:'ar-t',color:'#f59e0b',label:'°C',field:'t'},
+ h:{cv:'ch-h',box:'c-h',ar:'ar-h',color:'#38bdf8',label:'%',field:'h'},
+ co2:{cv:'ch-co2',box:'c-co2',ar:'ar-co2',color:'#22c55e',label:'ppm',field:'co2'}
 };
 let openCharts={t:false,h:false,co2:false};   // каждый график свёрнут по умолчанию
 
@@ -687,7 +694,7 @@ function drawChart(id,color,label,data,yfield){
   g.fillStyle=color+'22'; g.fill();
  }
  g.fillStyle='#e2e8f0'; g.font='12px sans-serif';
-// g.fillText(label,pad.l,11);
+ g.fillText(label,pad.l,11);
 }
 
 async function api(u){const r=await fetch(u);return r.json();}
@@ -695,9 +702,9 @@ async function api(u){const r=await fetch(u);return r.json();}
 async function pollLive(){
  try{
   const s=await api('/api/current');
-  $('v-t').innerHTML=s.temperature.toFixed(1)+'<span class="unit"> °C</span>';
-  $('v-h').innerHTML=s.humidity.toFixed(1)+'<span class="unit"> %</span>';
-  $('v-co2').innerHTML=s.co2+'<span class="unit"> ppm</span>';
+  $('v-t').innerHTML=s.temperature.toFixed(1);
+  $('v-h').innerHTML=s.humidity.toFixed(1);
+  $('v-co2').innerHTML=s.co2;
   $('s-dht').innerHTML=s.dhtOk?'<span class="ok"></span>':'<span class="bad">DHT22 нет связи</span>';
   $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
   $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip);

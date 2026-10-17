@@ -4,6 +4,7 @@
 #include <DHT.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <MHZ19.h>
 #include <Preferences.h>
@@ -22,6 +23,9 @@
 // Преднагрев MH-Z19: первые минуты после включения датчик отдаёт мусор
 // (обычно ~3 минуты). В это время показания не читаем, не пишем и не помним.
 #define MHZ19_HEATING_TIME (1000UL * 60UL * 3UL)
+
+// Имя устройства в сети (mDNS): открывать как http://climat.local
+#define MDNS_HOST "climat"
 
 #define DEFAULT_POINT_SEC 30
 #define DEFAULT_SAVE_MIN  5
@@ -57,6 +61,8 @@ struct Reading {
 Reading  latest;
 bool     dhtOk = false, mhzOk = false;
 bool     mhzHeating      = true;   // идёт преднагрев MH-Z19
+bool     mdnsStarted     = false;  // mDNS запущен (http://climat.local)
+bool     mdnsRestart     = false;  // сеть переподключилась — mDNS надо перерегистрировать
 uint32_t heatingStartMs  = 0;      // момент старта датчика (для отсчёта прогрева)
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
@@ -294,6 +300,8 @@ static String jsonCurrent() {
   doc["uptime"]       = millis() / 1000;
   doc["mode"]         = apMode ? "AP" : "STA";
   doc["ip"]           = WiFi.localIP().toString();
+  doc["mdns"]         = String(MDNS_HOST) + ".local";
+  doc["mdnsOk"]       = mdnsStarted;
   doc["nextLogInSec"] = (timeSynced && time(nullptr) > 1000000)
                             ? ((lastLogMs + saveIntervalMs > millis())
                                    ? (lastLogMs + saveIntervalMs - millis()) / 1000
@@ -559,6 +567,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
   <div class="panel">
     <h2>Подключение к домашней сети (STA)</h2>
     <p style="color:var(--mut);font-size:13px;margin-bottom:12px">После подключения устройство перезагрузится и выйдет в интернет через роутер. Точка доступа <b>CO2Monitor</b> остаётся резервным режимом, если сеть недоступна.<br>Если сохранённой сети нет (сразу после прошивки), устройство само попробует подключиться к сети по умолчанию.</p>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px">Устройство доступно по имени <b>http://climat.local</b> — IP искать не нужно. В режиме точки доступа работает любой адрес (например http://climat.it): встроенный DNS отвечает на все имена.</p>
     <div class="row">
       <input type="text" id="wssid" placeholder="SSID сети">
       <input type="password" id="wpass" placeholder="Пароль">
@@ -723,7 +732,8 @@ async function pollLive(){
    $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
   }
   $('s-dht').innerHTML=s.dhtOk?'<span class="ok"></span>':'<span class="bad">DHT22 нет связи</span>';
-  $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip);
+  $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip)+(s.mdnsOk?' · '+s.mdns:'');
+  $('netBadge').title=s.mdnsOk?('Можно открывать по имени: http://'+s.mdns):'mDNS не запущен — используйте IP';
   $('timeBadge').textContent='Дата: '+s.datetime;
  
   if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(); }
@@ -963,6 +973,44 @@ static void setupWeb() {
   server.begin();
 }
 
+// mDNS: чтобы открывать веб-интерфейс по имени, а не по IP.
+// Работает и в STA, и в AP режиме.
+// ВАЖНО: в этом ядре ESPmDNS не подписывается на события сети (подписка
+// закомментирована в ESPmDNS.cpp), поэтому если Wi-Fi поднялся ПОСЛЕ старта,
+// или произошёл реконнект — mDNS нужно перезапустить вручную (mdnsRestart).
+static void startMdns() {
+  if (mdnsStarted && !mdnsRestart)
+    return;
+
+  static uint32_t lastTry = 0;
+  if (!mdnsRestart && lastTry && millis() - lastTry < 10000)
+    return;
+  lastTry = millis();
+
+  if (mdnsRestart) {
+    mdnsRestart = false;
+    if (mdnsStarted) {
+      MDNS.end();            // перерегистрируемся на новом интерфейсе
+      mdnsStarted = false;
+    }
+  }
+
+  if (WiFi.getMode() == WIFI_OFF)
+    return;
+
+  if (!MDNS.begin(MDNS_HOST)) {
+    Serial.println("[MDNS] не запустился, повторю позже");
+    return;
+  }
+  MDNS.setInstanceName("Climat Monitor");
+  MDNS.addService("http", "tcp", 80);
+  mdnsStarted = true;
+  Serial.printf("[MDNS] открыть: http://%s.local (%s, IP %s)\n", MDNS_HOST,
+                apMode ? "AP" : "STA",
+                apMode ? WiFi.softAPIP().toString().c_str()
+                       : WiFi.localIP().toString().c_str());
+}
+
 static void setupNetwork() {
   cfgSsid = prefs.getString("ssid", "");
   cfgPass = prefs.getString("pass", "");
@@ -978,12 +1026,14 @@ static void setupNetwork() {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       Serial.printf("[NET] STA подключено, IP: %s\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      mdnsRestart = true;   // интерфейс поднялся — перерегистрируем mDNS
     }
   });
 
   if (cfgSsid.length()) {
     Serial.println("[NET] Пробую подключиться к: " + cfgSsid);
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setHostname(MDNS_HOST);   // имя в DHCP: роутеры с локальным DNS дадут climat
     WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     uint32_t t0 = millis();
@@ -1003,6 +1053,7 @@ static void setupNetwork() {
 
   dnsServer.start(53, "*", WiFi.softAPIP());
   dnsStarted = true;
+  startMdns();
   if (apMode) {
     Serial.printf("[NET] AP: %s  http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   }
@@ -1063,6 +1114,7 @@ void loop() {
   if (dnsStarted)
     dnsServer.processNextRequest();
 
+  startMdns();   // если Wi-Fi подключился позже — поднимем mDNS
   static uint32_t lastRead = 0;
   if (millis() - lastRead > 5000) {
     lastRead = millis();

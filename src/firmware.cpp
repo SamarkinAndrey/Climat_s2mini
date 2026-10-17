@@ -19,6 +19,10 @@
 #define MAX_LOG_FILES 20
 #define NTP_SERVER    "ru.pool.ntp.org"
 
+// Преднагрев MH-Z19: первые минуты после включения датчик отдаёт мусор
+// (обычно ~3 минуты). В это время показания не читаем, не пишем и не помним.
+#define MHZ19_HEATING_TIME (1000UL * 60UL * 3UL)
+
 #define DEFAULT_POINT_SEC 30
 #define DEFAULT_SAVE_MIN  5
 #define MIN_POINT_SEC     5
@@ -52,6 +56,8 @@ struct Reading {
 
 Reading  latest;
 bool     dhtOk = false, mhzOk = false;
+bool     mhzHeating      = true;   // идёт преднагрев MH-Z19
+uint32_t heatingStartMs  = 0;      // момент старта датчика (для отсчёта прогрева)
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
 uint32_t lastPointMs     = 0;
@@ -194,6 +200,22 @@ static void readSensors() {
   }
   dhtOk = ok;
 
+  // --- MH-Z19 ---
+  // Первые MHZ19_HEATING_TIME после включения датчик греется и отдаёт мусор:
+  // не читаем его, не помечаем как «нет связи», точки в это время не пишутся.
+  uint32_t uptime = millis() - heatingStartMs;
+  mhzHeating      = (uptime < MHZ19_HEATING_TIME);
+  if (mhzHeating) {
+    static uint32_t lastHeatLog = 0xFFFFFFFFUL;
+    if (uptime / 30000UL != lastHeatLog) {   // отмечаемся в мониторе раз в 30 с
+      lastHeatLog = uptime / 30000UL;
+      Serial.printf("[MHZ] прогрев: %lu/%lu с — показания не пишутся\n",
+                    uptime / 1000UL, MHZ19_HEATING_TIME / 1000UL);
+    }
+    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+    return;
+  }
+
   int  co2   = mhz.getCO2(false, true);
   byte err   = mhz.errorCode;
   bool co2ok = (co2 > 0 && co2 <= mhzRange);
@@ -243,8 +265,10 @@ static void tryNtp() {
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     latest.timestamp = (uint32_t)tt;
-    logReading(latest);
-    pushLivePoint(latest);
+    if (!mhzHeating) {            // во время прогрева точки не создаём
+      logReading(latest);
+      pushLivePoint(latest);
+    }
     lastLogMs   = millis();
     lastPointMs = millis();
   }
@@ -257,6 +281,10 @@ static String jsonCurrent() {
   doc["co2"]         = latest.co2;
   doc["dhtOk"]       = dhtOk;
   doc["mhzOk"]       = mhzOk;
+  doc["heating"]     = mhzHeating;
+  doc["heatLeft"]    = mhzHeating
+                         ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
+                         : 0;
   doc["timestamp"]   = latest.timestamp;
   if (timeSynced && time(nullptr) > 1000000) {
     doc["datetime"] = fmtTime(latest.timestamp);
@@ -422,6 +450,7 @@ main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 #v-t{color:#f59e0b}
 #v-h{color:#38bdf8}
 #v-co2{color:#22c55e}
+#v-co2.heat{color:var(--bad);font-size:22px}   /* слово «нагрев» вместо цифр */
 .marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
 .mchart{margin-top:10px}
 .prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
@@ -431,7 +460,7 @@ main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 .prow > button.btn{margin-left:auto;margin-right:auto}
 .pbtns{justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
 input[type=number]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;text-align:right}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.heat{color:var(--bad)}
 .panel{background:var(--card);border-radius:14px;padding:12px;margin-bottom:12px;min-width:0}
 .panel h2{font-size:14px;margin-bottom:10px;color:var(--acc)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -684,9 +713,16 @@ async function pollLive(){
   const s=await api('/api/current');
   $('v-t').innerHTML=s.temperature.toFixed(1);
   $('v-h').innerHTML=s.humidity.toFixed(1);
-  $('v-co2').innerHTML=s.co2;
+  const heat=!!s.heating;
+  $('v-co2').classList.toggle('heat',heat);
+  if(heat){
+   $('v-co2').innerHTML='нагрев';
+   $('s-mhz').innerHTML='<span class="heat">идёт прогрев, '+(s.heatLeft||0)+' с</span>';
+  }else{
+   $('v-co2').innerHTML=s.co2;
+   $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
+  }
   $('s-dht').innerHTML=s.dhtOk?'<span class="ok"></span>':'<span class="bad">DHT22 нет связи</span>';
-  $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
   $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip);
   $('timeBadge').textContent='Дата: '+s.datetime;
  
@@ -736,7 +772,7 @@ async function calibrate(cmd){
 
 async function loadStatus(){
  try{const s=await api('/api/sensor');
-  $('calstat').innerHTML=`Диапазон: ${s.range} ppm · ABC: ${s.abc===1||s.abc===true?'вкл':'выкл'} · CO₂ сейчас: ${s.co2} ppm · Связь: ${s.mhzOk?'OK':'нет данных'}`;
+  $('calstat').innerHTML=`Диапазон: ${s.range} ppm · ABC: ${s.abc===1||s.abc===true?'вкл':'выкл'} · CO₂ сейчас: ${s.heating?'нагрев':s.co2+' ppm'} · Связь: ${s.heating?'прогрев':(s.mhzOk?'OK':'нет данных')}`;
  }catch(e){$('calstat').textContent='Ошибка запроса';}}
 
 async function clearLogs(){
@@ -910,6 +946,7 @@ static void setupWeb() {
     doc["abc"]   = mhz.getABC();
     doc["co2"]   = latest.co2;
     doc["mhzOk"] = mhzOk;
+    doc["heating"] = mhzHeating;
     String out;
     serializeJson(doc, out);
     req->send(200, "application/json", out);
@@ -998,14 +1035,16 @@ void setup() {
   dht.begin();
 
   mhzSerial.begin(9600, SERIAL_8N1, MHZ_RX, MHZ_TX);
+  heatingStartMs = millis();             // с этого момента считаем преднагрев
   mhz.begin(mhzSerial);
   mhz.setFilter(true, false);
   mhz.setRange(5000);
   mhz.autoCalibration(prefs.getBool("abc", true), 24);
   mhzRange = mhz.getRange();
-  Serial.printf("[MHZ] UART1 rx=%d tx=%d, range=%d, ABC=%d, err=%u\n",
+  Serial.printf("[MHZ] UART1 rx=%d tx=%d, range=%d, ABC=%d, err=%u, прогрев %lu с\n",
                 MHZ_RX, MHZ_TX, mhzRange,
-                prefs.getBool("abc", true) ? 1 : 0, mhz.errorCode);
+                prefs.getBool("abc", true) ? 1 : 0, mhz.errorCode,
+                MHZ19_HEATING_TIME / 1000UL);
   delay(3000);
 
   setupNetwork();
@@ -1034,14 +1073,14 @@ void loop() {
   if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
     lastPointMs      = millis();
     latest.timestamp = (uint32_t)time(nullptr);
-    if (dhtOk || mhzOk)
+    if ((dhtOk || mhzOk) && !mhzHeating)
       pushLivePoint(latest);
   }
 
   if (millis() - lastLogMs >= saveIntervalMs) {
     lastLogMs        = millis();
     latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
-    if (dhtOk || mhzOk)
+    if ((dhtOk || mhzOk) && !mhzHeating)
       logReading(latest);
   }
 

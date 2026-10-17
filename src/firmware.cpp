@@ -107,8 +107,16 @@ static void listFiles(const char *dirPath, std::vector<String> &out) {
   if (!dir || !dir.isDirectory())
     return;
   for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
-    if (!entry.isDirectory())
-      out.push_back(String(entry.name()));
+    if (entry.isDirectory()) {
+      entry.close();
+      continue;
+    }
+    String name  = String(entry.name());
+    int    slash = name.lastIndexOf('/');
+    if (slash >= 0)
+      name = name.substring(slash + 1);
+    if (name.length())
+      out.push_back(String(dirPath) + "/" + name);
     entry.close();
   }
   dir.close();
@@ -367,11 +375,17 @@ static String listLogFiles() {
   String              out = "[";
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
-  const int prefixLen = strlen(LOGS_DIR) + 1;
+
+  for (size_t i = 0; i < names.size(); i++)
+    for (size_t j = i + 1; j < names.size(); j++)
+      if (names[j] < names[i])
+        std::swap(names[i], names[j]);
   for (size_t i = 0; i < names.size(); i++) {
+    int    slash = names[i].lastIndexOf('/');
+    String base  = slash >= 0 ? names[i].substring(slash + 1) : names[i];
     if (i)
       out += ",";
-    out += "\"" + names[i].substring(prefixLen) + "\"";
+    out += "\"" + base + "\"";
   }
   out += "]";
   return out;

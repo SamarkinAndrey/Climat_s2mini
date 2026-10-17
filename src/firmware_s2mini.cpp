@@ -3,8 +3,8 @@
 //  DHT22 (t/rH) + MH-Z19B (CO2), сохранение каждые 10 мин,
 //  калибровка MH-Z19, AP/STA режимы, веб-интерфейс с графиками.
 //
-//  Подключение:
-//    DHT22 DATA -> GPIO 4  (+ подтяжка к 3.3V)
+//  Подключение (пины согласованы с проектом greenhouse):
+//    DHT22 DATA -> GPIO 5   (+ подтяжка к 3.3V)   [greenhouse: DHT_PIN 5]
 //    MH-Z19 RX  -> GPIO 16 (TX ESP32)
 //    MH-Z19 TX  -> GPIO 17 (RX ESP32)
 //    MH-Z19 Vin -> 5V (VBUS), GND -> GND
@@ -16,6 +16,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <algorithm>
 #include <AsyncTCP.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
@@ -23,28 +24,49 @@
 #include <MHZ19.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <dhtnew.h>
-#include <SoftwareSerial.h>
+#include <DHT.h>
 
 // ----------------------------- НАСТРОЙКИ -----------------------------
-#define DHT_PIN 4        // DHT22 data pin
-#define MHZ_RX 17        // MH-Z19 TX -> GPIO17
-#define MHZ_TX 16        // MH-Z19 RX <- GPIO16
-#define LOG_INTERVAL_MS (10UL * 60UL * 1000UL)  // 10 минут
+// --- Пины (как в проекте greenhouse / Piranha ESP32) ---
+#define DHT_PIN 5        // DHT22 data pin  (greenhouse: DHT_PIN 5)
+#define DHT_TYPE 22      // тип датчика     (greenhouse: DHT_TYPE 22)
+#define MHZ_RX 17        // MH-Z19 TX -> GPIO17 (UART, у нас свой)
+#define MHZ_TX 16        // MH-Z19 RX <- GPIO16 (UART, у нас свой)
 #define LOGS_DIR "/logs"
 #define MAX_LOG_FILES 20                         // ротация старых файлов
 #define NTP_SERVER "ru.pool.ntp.org"
 
+// --- Запись точек ---
+// Промежуточные точки держим в RAM (кольцевой буфер) для плавных графиков,
+// а в файл пишем реже — чтобы не изнашивать flash и не раздувать логи.
+#define DEFAULT_POINT_SEC 30                     // период промежуточной точки, сек
+#define DEFAULT_SAVE_MIN  5                      // период сохранения в файл, мин
+#define MIN_POINT_SEC     5
+#define MAX_POINT_SEC     600
+#define MIN_SAVE_MIN      1
+#define MAX_SAVE_MIN      1440
+#define MAX_LIVE_POINTS   1440                   // буфер RAM: 12 ч при 30 с
+#define MAX_HISTORY_OUT   400                    // максимум точек в ответе /api/history
+
 const char *AP_SSID = "CO2Monitor";
 const char *AP_PASS = "12345678";  // минимум 8 символов
 
+// --- Сеть по умолчанию ---
+// Используется для автоподключения, если в памяти нет сохранённой сети
+// (например, после первой прошивки или полного стирания flash).
+// Кнопка «Забыть сеть» в веб-интерфейсе отключает это автоподключение.
+#define DEFAULT_WIFI_SSID "Andrey_Lan"
+#define DEFAULT_WIFI_PASS "2p0r1o8w"
+
 // ----------------------------- ОБЪЕКТЫ -----------------------------
-DHTNEW dht(DHT_PIN);
-SoftwareSerial mhzSerial(MHZ_RX, MHZ_TX);
+DHT dht(DHT_PIN, DHT_TYPE);
+// Аппаратный UART (как в greenhouse) — надёжнее SoftwareSerial на ESP32 при работающем Wi-Fi
+HardwareSerial mhzSerial(1);
 MHZ19 mhz;
 Preferences prefs;
 AsyncWebServer server(80);
 DNSServer dnsServer;
+bool dnsStarted = false;   // DNS-сервер запущен только когда реально нужен (AP)
 
 // ----------------------------- СОСТОЯНИЕ -----------------------------
 struct Reading {
@@ -58,10 +80,26 @@ Reading latest;
 bool dhtOk = false, mhzOk = false;
 uint32_t lastLogMs = 0;
 uint32_t lastNtpTry = 0;
+uint32_t lastPointMs = 0;                       // время последней промежуточной точки
 bool apMode = true;   // текущий режим сети
 bool timeSynced = false;
+uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;      // период точек в RAM
+uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL; // период записи в файл
+uint32_t pointsSeq = 0;   // счётчик точек (меняется при каждой новой точке)
+
+// --- Кольцевой буфер промежуточных точек (в RAM, для графиков) ---
+struct Point {
+  uint32_t ts;
+  float t;
+  float h;
+  uint16_t co2;
+};
+Point liveBuf[MAX_LIVE_POINTS];
+int liveHead = 0;    // индекс следующей записи
+int liveCount = 0;   // сколько точек валидно
 
 String cfgSsid, cfgPass;
+int mhzRange = 5000;   // диапазон MH-Z19 (читается один раз при старте)
 
 // ----------------------------- УТИЛИТЫ -----------------------------
 static String fmtTime(uint32_t ts) {
@@ -76,7 +114,16 @@ static String fmtTime(uint32_t ts) {
 static String todayFile() {
   time_t now = time(nullptr);
   struct tm t;
-  localtime_r(&now, &t);
+  if (timeSynced && now > 1000000) {
+    localtime_r(&now, &t);
+  } else {
+    struct tm fallback;
+    memset(&fallback, 0, sizeof(fallback));
+    fallback.tm_year = 100; // 2000
+    fallback.tm_mon = 0;
+    fallback.tm_mday = 1;
+    t = fallback;
+  }
   char name[32];
   sprintf(name, "%s/%04d-%02d-%02d.csv", LOGS_DIR, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
   return String(name);
@@ -108,10 +155,12 @@ static void rotateLogsIfNeeded() {
     names.erase(names.begin() + oldestIdx);
   }
 }
-
 static void logReading(const Reading &r) {
   if (!LittleFS.exists(LOGS_DIR)) LittleFS.mkdir(LOGS_DIR);
-
+  if (!timeSynced || (time(nullptr) < 1000000)) {
+    Serial.println("[LOG] время не синхронизировано (NTP), пропускаю запись в файл");
+    return;
+  }
   String path = todayFile();
   bool isNew = !LittleFS.exists(path);
 
@@ -124,39 +173,104 @@ static void logReading(const Reading &r) {
   f.printf("%lu,%s,%.2f,%.2f,%u\n", r.timestamp, fmtTime(r.timestamp).c_str(),
            r.temperature, r.humidity, r.co2);
   f.close();
+  pointsSeq++;   // появилась новая сохранённая точка
   Serial.printf("[LOG] записано в %s: %.1fC %.1f%% %uppm\n",
                 path.c_str(), r.temperature, r.humidity, r.co2);
   rotateLogsIfNeeded();
 }
 
+// Промежуточная точка в RAM (для плавных графиков, без записи во flash)
+static void pushLivePoint(const Reading &r) {
+  Point &p = liveBuf[liveHead];
+  p.ts = r.timestamp;
+  p.t = r.temperature;
+  p.h = r.humidity;
+  p.co2 = r.co2;
+  liveHead = (liveHead + 1) % MAX_LIVE_POINTS;
+  if (liveCount < MAX_LIVE_POINTS) liveCount++;
+  pointsSeq++;
+}
+
 // ----------------------------- ДАТЧИКИ -----------------------------
 static void readSensors() {
-  int status = dht.read();
-  dhtOk = (status == DHTLIB_OK);
-  if (dhtOk) {
-    latest.temperature = dht.getTemperature();
-    latest.humidity = dht.getHumidity();
+  // Adafruit DHT (как в greenhouse) — дольше держит пробуждение (20 мс),
+  // что нужно для AM2320 в однопроводном режиме
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  bool ok = !isnan(t) && !isnan(h);
+  if (ok) {
+    latest.temperature = t;
+    latest.humidity = h;
   }
+  // логируем при смене статуса, чтобы видеть причину в мониторе
+  static int lastOk = -1;
+  if ((int)ok != lastOk) {
+    lastOk = ok;
+    if (ok) Serial.printf("[DHT] pin=%d OK, t=%.2f h=%.2f\n", DHT_PIN, t, h);
+    else    Serial.printf("[DHT] pin=%d нет отклика (NaN) — проверь питание/пин/подтяжку\n", DHT_PIN);
+  }
+  dhtOk = ok;
 
+  // --- MH-Z19 ---
+  // getCO2(isunLimited, force): false,true = запросить значение в пределах
+  // заданного диапазона (setRange(5000)).
   int co2 = mhz.getCO2(false, true);
-  if (co2 > 0 && co2 <= mhz.getRange()) {
+  byte err = mhz.errorCode;   // снимаем сразу: getRange() перезаписывает errorCode
+  bool co2ok = (co2 > 0 && co2 <= mhzRange);
+
+  // одиночный сбойный кадр (CRC/таймаут/фильтр) не должен сразу давать
+  // «нет связи» — статус падает только после 3 подряд неудачных чтений
+  static int co2Fail = 0;
+  static byte lastErr = 0xFF;
+  if (co2ok) {
+    co2Fail = 0;
     latest.co2 = co2;
     mhzOk = true;
+  } else if (err == RESULT_FILTER) {
+    // датчик ответил; библиотека отбраковала значение (кратковременный
+    // сброс ABC к 410 ppm) — это не потеря связи, оставляем последнее значение
+    co2Fail = 0;
   } else {
-    mhzOk = false;
+    if (co2Fail < 100) co2Fail++;
+    if (co2Fail >= 3) mhzOk = false;
   }
 
-  latest.timestamp = timeSynced ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000);
+  if (err != lastErr) {
+    lastErr = err;
+    if (co2ok)
+      Serial.printf("[MHZ] OK: %d ppm (err=%u)\n", co2, err);
+    else if (err == RESULT_FILTER)
+      Serial.println("[MHZ] filter: датчик ответил, значение отбраковано (сброс ABC)");
+    else
+      Serial.printf("[MHZ] ошибка чтения, код %u (1=OK 2=timeout 3=match 4=crc 5=filter), сбоев подряд: %d\n",
+                    err, co2Fail);
+  }
+
+  latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
 }
 
 // ----------------------------- NTP -----------------------------
 static void tryNtp() {
   if (WiFi.status() != WL_CONNECTED) return;
   unsigned long now = millis();
-  if (now - lastNtpTry < 300000) return;  // раз в 5 минут
+  // не блокируем, пробуем раз в 10 сек, проверяем синхронизацию
+  if (now - lastNtpTry < 10000) return;
   lastNtpTry = now;
   configTime(3 * 3600, 0, NTP_SERVER);  // MSK +3
-  timeSynced = true;
+  time_t tt = time(nullptr);
+  if (tt > 1000000 && !timeSynced) {
+    timeSynced = true;
+    struct tm t;
+    localtime_r(&tt, &t);
+    Serial.printf("[NTP] Синхронизирован: %04d-%02d-%02d %02d:%02d:%02d (MSK)\n",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec);
+    latest.timestamp = (uint32_t)tt;
+    logReading(latest);   // первую точку пишем сразу, не ждём интервала сохранения
+    pushLivePoint(latest);
+    lastLogMs = millis();
+    lastPointMs = millis();
+  }
 }
 
 // ----------------------------- WEB: JSON -----------------------------
@@ -168,61 +282,107 @@ static String jsonCurrent() {
   doc["dhtOk"] = dhtOk;
   doc["mhzOk"] = mhzOk;
   doc["timestamp"] = latest.timestamp;
-  doc["datetime"] = fmtTime(latest.timestamp);
+  if (timeSynced && time(nullptr) > 1000000) {
+    doc["datetime"] = fmtTime(latest.timestamp);
+  } else {
+    doc["datetime"] = "NTP ожидание...";
+  }
   doc["uptime"] = millis() / 1000;
   doc["mode"] = apMode ? "AP" : "STA";
   doc["ip"] = WiFi.localIP().toString();
-  doc["nextLogInSec"] = (lastLogMs + LOG_INTERVAL_MS > millis())
-                            ? (lastLogMs + LOG_INTERVAL_MS - millis()) / 1000
+  doc["nextLogInSec"] = (timeSynced && time(nullptr) > 1000000)
+                            ? ((lastLogMs + saveIntervalMs > millis())
+                                   ? (lastLogMs + saveIntervalMs - millis()) / 1000
+                                   : 0)
                             : 0;
+  doc["pointSec"] = pointIntervalMs / 1000;
+  doc["saveMin"] = saveIntervalMs / 60000;
+  doc["points"] = liveCount;
+  doc["pointsSeq"] = pointsSeq;
   String out;
   serializeJson(doc, out);
   return out;
 }
 
 static String jsonHistory(int points) {
-  // последние N точек из последних файлов
-  JsonDocument doc;
-  JsonArray arr = doc.to<JsonArray>();
+  if (points < 1) points = 1;
+  if (points > 20000) points = 20000;
 
-  std::vector<String> names;
-  listFiles(LOGS_DIR, names);
-  // сортировка имён (даты) по возрастанию
-  for (size_t i = 0; i < names.size(); i++)
-    for (size_t j = i + 1; j < names.size(); j++)
-      if (names[j] < names[i]) std::swap(names[i], names[j]);
+  // ---- 1. промежуточные точки из RAM (высокое разрешение) ----
+  std::vector<Point> live;
+  live.reserve(liveCount);
+  int first = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  for (int i = 0; i < liveCount; i++) live.push_back(liveBuf[(first + i) % MAX_LIVE_POINTS]);
+  uint32_t oldestLive = live.empty() ? 0xFFFFFFFFu : live.front().ts;
 
-  // читаем файлы справа налево, пока не наберём points точек
+  int fromFile = points - (int)live.size();
+  if (fromFile < 0) {
+    live.erase(live.begin(), live.begin() + ((int)live.size() - points));
+    fromFile = 0;
+  }
+  if (fromFile > MAX_HISTORY_OUT) fromFile = MAX_HISTORY_OUT;
+
+  // ---- 2. старые точки из файлов (только то, что старше живой истории) ----
   std::vector<String> rows;
-  for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < points; fi--) {
-    File f = LittleFS.open(names[fi], "r");
-    if (!f) continue;
-    std::vector<String> fileRows;
-    while (f.available()) {
-      String line = f.readStringUntil('\n');
-      line.trim();
-      if (line.length() && line.indexOf(',') > 0 && !line.startsWith("timestamp"))
-        fileRows.push_back(line);
+  if (fromFile > 0) {
+    std::vector<String> names;
+    listFiles(LOGS_DIR, names);
+    for (size_t i = 0; i < names.size(); i++)
+      for (size_t j = i + 1; j < names.size(); j++)
+        if (names[j] < names[i]) std::swap(names[i], names[j]);
+
+    for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < fromFile; fi--) {
+      File f = LittleFS.open(names[fi], "r");
+      if (!f) continue;
+      std::vector<String> fileRows;
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() && line.indexOf(',') > 0 && !line.startsWith("timestamp"))
+          fileRows.push_back(line);
+      }
+      f.close();
+      // берём строки, которые старше самой старой живой точки
+      for (int i = (int)fileRows.size() - 1; i >= 0 && (int)rows.size() < fromFile; i--) {
+        int c = fileRows[i].indexOf(',');
+        if (c <= 0) continue;
+        uint32_t ts = (uint32_t)fileRows[i].substring(0, c).toInt();
+        if (ts == 0 || ts >= oldestLive) continue;   // уже показано живыми точками
+        rows.push_back(fileRows[i]);
+      }
     }
-    f.close();
-    int need = points - rows.size();
-    int start = max(0, (int)fileRows.size() - need);
-    for (int i = start; i < (int)fileRows.size(); i++) rows.push_back(fileRows[i]);
+    std::reverse(rows.begin(), rows.end());   // к возрастанию времени
   }
 
-  for (size_t i = 0; i < rows.size(); i++) {
-    // формат: ts,datetime,t,h,co2
-    const String &ln = rows[i];
-    int p1 = ln.indexOf(',');
-    int p2 = ln.indexOf(',', p1 + 1);
-    int p3 = ln.indexOf(',', p2 + 1);
-    int p4 = ln.indexOf(',', p3 + 1);
+  // ---- 3. объединяем и при необходимости прореживаем ----
+  size_t total = rows.size() + live.size();
+  int step = (total > MAX_HISTORY_OUT) ? (int)((total + MAX_HISTORY_OUT - 1) / MAX_HISTORY_OUT) : 1;
+
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  // шаг сдвигаем так, чтобы самая свежая точка всегда попадала в ответ
+  int off = (total > 0) ? ((int)total - 1) % step : 0;
+  for (int i = off; i < (int)total; i += step) {
     JsonObject o = arr.createNestedObject();
-    o["ts"] = ln.substring(0, p1).toInt();
-    o["dt"] = ln.substring(p1 + 1, p2);
-    o["t"] = ln.substring(p2 + 1, p3).toFloat();
-    o["h"] = ln.substring(p3 + 1, p4).toFloat();
-    o["co2"] = ln.substring(p4 + 1).toInt();
+    if (i < (int)rows.size()) {
+      const String &ln = rows[i];
+      int p1 = ln.indexOf(',');
+      int p2 = ln.indexOf(',', p1 + 1);
+      int p3 = ln.indexOf(',', p2 + 1);
+      int p4 = ln.indexOf(',', p3 + 1);
+      o["ts"] = ln.substring(0, p1).toInt();
+      o["dt"] = ln.substring(p1 + 1, p2);
+      o["t"] = ln.substring(p2 + 1, p3).toFloat();
+      o["h"] = ln.substring(p3 + 1, p4).toFloat();
+      o["co2"] = ln.substring(p4 + 1).toInt();
+    } else {
+      const Point &p = live[i - rows.size()];
+      o["ts"] = p.ts;
+      o["dt"] = fmtTime(p.ts);
+      o["t"] = p.t;
+      o["h"] = p.h;
+      o["co2"] = p.co2;
+    }
   }
 
   String out;
@@ -244,63 +404,87 @@ static String listLogFiles() {
 }
 
 // ----------------------------- HTML (веб-интерфейс) -----------------------------
-// Chart.js подключается с CDN; при работе без интернета графики используют
-// данные из /api/history, но библиотека может не загрузиться — тогда
-// показывается таблица последних значений.
+// Графики рисуются встроенным canvas-рендерером (без Chart.js/CDN),
+// поэтому работают и без интернета; данные берутся из /api/history.
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CO2 Monitor · ESP32-S2</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<title>Climat Monitor</title>
 <style>
 :root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--mut:#94a3b8;--acc:#38bdf8;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444}
 *{box-sizing:border-box;margin:0;padding:0}
+html,body{overflow-x:hidden}
 body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
-header{padding:16px 24px;background:var(--card);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-header h1{font-size:18px;font-weight:600}
-.badge{font-size:12px;padding:3px 10px;border-radius:999px;background:#334155;color:var(--mut)}
-nav{display:flex;gap:4px;padding:8px 24px;background:var(--card);border-bottom:1px solid #334155}
-nav button{background:none;border:none;color:var(--mut);padding:8px 16px;cursor:pointer;font-size:14px;border-radius:8px}
+header{padding:10px 12px;background:var(--card);display:flex;flex-direction:column;gap:8px;width:100%}
+header h1{font-size:17px;font-weight:600;line-height:1.2}
+.badges{display:flex;gap:8px;flex-wrap:wrap;min-width:0}
+.badge{font-size:12px;padding:3px 10px;border-radius:999px;background:#334155;color:var(--mut);white-space:nowrap}
+nav{display:flex;gap:4px;padding:6px 10px;background:var(--card);border-bottom:1px solid #334155;overflow-x:auto;scrollbar-width:none;width:100%}
+nav::-webkit-scrollbar{display:none}
+nav button{background:none;border:none;color:var(--mut);padding:8px 12px;cursor:pointer;font-size:13px;border-radius:8px;white-space:nowrap;flex:0 0 auto}
 nav button.active{background:var(--acc);color:#04263a;font-weight:600}
-main{padding:24px;max-width:1100px;margin:0 auto}
+main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 .tab{display:none}.tab.active{display:block}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
-.card{background:var(--card);border-radius:16px;padding:20px}
-.card .label{font-size:13px;color:var(--mut);margin-bottom:6px}
-.card .value{font-size:34px;font-weight:700}
-.card .unit{font-size:14px;color:var(--mut);font-weight:400}
-.card .status{font-size:12px;margin-top:6px}
+.metric{padding:12px}
+.mhead{display:flex;align-items:baseline;gap:8px;cursor:pointer;-webkit-user-select:none;user-select:none}
+.mlabel{font-size:17px;color:var(--mut)}
+.mhead .status{font-size:12px;margin-left:6px}
+.mval{margin-left:auto;font-size:29px;font-weight:700;line-height:1.1;text-align:right}
+.mval .unit{font-size:13px;color:var(--mut);font-weight:400}
+.marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
+.mchart{margin-top:10px}
+.prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
+.prow label{color:var(--mut);font-size:14px;white-space:nowrap}
+.prow select,.prow input[type=number]{flex:1 1 auto;min-width:0;width:100%}
+.prow select{text-align:right;text-align-last:right;padding-right:34px}
+.pbtns{justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
+input[type=number]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;text-align:right}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
-.panel{background:var(--card);border-radius:16px;padding:20px;margin-bottom:16px}
-.panel h2{font-size:15px;margin-bottom:12px;color:var(--acc)}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-input[type=text],input[type=password]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:14px}
-button.btn{background:var(--acc);border:none;color:#04263a;padding:9px 16px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.panel{background:var(--card);border-radius:14px;padding:12px;margin-bottom:12px;min-width:0}
+.panel h2{font-size:14px;margin-bottom:10px;color:var(--acc)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text],input[type=password]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;max-width:100%}
+button.btn{background:var(--acc);border:none;color:#04263a;padding:9px 14px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
 button.btn.sec{background:#334155;color:var(--txt)}
 button.btn.warn{background:var(--warn);color:#241503}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:7px 10px;text-align:left;border-bottom:1px solid #334155;color:var(--mut)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #334155;color:var(--mut)}
 th{color:var(--txt)}
-canvas{max-height:340px}
-select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;border-radius:8px}
+canvas{display:block;width:100%}
+select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;border-radius:8px;max-width:100%}
 #msg{font-size:13px;color:var(--ok);min-height:18px;margin-top:8px}
-.gridchart{display:grid;grid-template-columns:1fr;gap:20px}
-@media(min-width:900px){.gridchart{grid-template-columns:1fr 1fr}}
-.full{grid-column:1/-1}
+@media(min-width:760px){
+ header{padding:14px 24px;flex-direction:row;align-items:center;flex-wrap:wrap;gap:12px}
+ .badges{margin-left:auto}
+ nav{padding:8px 24px}
+ nav button{font-size:14px;padding:8px 16px}
+ main{padding:24px}
+ .metric{padding:16px}
+ .mlabel{font-size:19px}
+ .mval{font-size:36px}
+ .mval .unit{font-size:15px}
+ .mhead .status{font-size:13px}
+ .panel{border-radius:16px;padding:18px;margin-bottom:16px}
+ .panel h2{font-size:15px}
+ table{font-size:13px}
+ th,td{padding:7px 10px}
+}
+
 </style>
 </head>
 <body>
 <header>
-  <h1>🌿 CO2 Monitor · ESP32-S2 mini</h1>
-  <span class="badge" id="netBadge">—</span>
-  <span class="badge" id="timeBadge">—</span>
-  <span class="badge" id="logBadge">—</span>
+  <h1>🌿 Climat Monitor</h1>
+  <div class="badges">
+    <span class="badge" id="netBadge">—</span>
+    <span class="badge" id="timeBadge">—</span>
+    <span class="badge" id="logBadge">—</span>
+  </div>
 </header>
 <nav>
-  <button class="active" data-tab="live" onclick="showTab('live')">Реальное время</button>
-  <button data-tab="charts" onclick="showTab('charts')">Графики</button>
+  <button class="active" data-tab="live" onclick="showTab('live')">Показания</button>
   <button data-tab="wifi" onclick="showTab('wifi')">Wi-Fi</button>
   <button data-tab="calib" onclick="showTab('calib')">Калибровка MH-Z19</button>
   <button data-tab="data" onclick="showTab('data')">Данные</button>
@@ -308,38 +492,54 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 <main>
 
 <div class="tab active" id="tab-live">
-  <div class="cards">
-    <div class="card"><div class="label">Температура</div><div class="value" id="v-t">—<span class="unit"> °C</span></div><div class="status" id="s-dht"></div></div>
-    <div class="card"><div class="label">Влажность</div><div class="value" id="v-h">—<span class="unit"> %</span></div></div>
-    <div class="card"><div class="label">CO₂</div><div class="value" id="v-co2">—<span class="unit"> ppm</span></div><div class="status" id="s-mhz"></div></div>
-    <div class="card"><div class="label">Следующая запись</div><div class="value" id="v-next">—<span class="unit"> c</span></div><div class="status">каждые 10 минут</div></div>
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('t')">
+      <span class="mlabel">Температура <span class="status" id="s-dht"></span></span>
+      <span class="mval" id="v-t">—<span class="unit"> °C</span></span>
+      <span class="marrow" id="ar-t">▸</span>
+    </div>
+    <div class="mchart" id="c-t" style="display:none"><canvas id="ch-t"></canvas></div>
   </div>
-  <div class="panel"><h2>Последние 12 часов (обновление live)</h2><canvas id="liveChart"></canvas></div>
-</div>
 
-<div class="tab" id="tab-charts">
-  <div class="row" style="margin-bottom:16px">
-    <label>Период:</label>
-    <select id="rangeSel" onchange="loadCharts()">
-      <option value="144">12 часов</option>
-      <option value="288">2 суток</option>
-      <option value="720" selected>5 суток</option>
-      <option value="2000">Максимум (~14 суток)</option>
-    </select>
-    <button class="btn sec" onclick="loadCharts()">Обновить</button>
-    <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('h')">
+      <span class="mlabel">Влажность</span>
+      <span class="mval" id="v-h">—<span class="unit"> %</span></span>
+      <span class="marrow" id="ar-h">▸</span>
+    </div>
+    <div class="mchart" id="c-h" style="display:none"><canvas id="ch-h"></canvas></div>
   </div>
-  <div class="gridchart">
-    <div class="panel full"><h2>CO₂, ppm</h2><canvas id="chCo2"></canvas></div>
-    <div class="panel"><h2>Температура, °C</h2><canvas id="chT"></canvas></div>
-    <div class="panel"><h2>Влажность, %</h2><canvas id="chH"></canvas></div>
+
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('co2')">
+      <span class="mlabel">CO₂ <span class="status" id="s-mhz"></span></span>
+      <span class="mval" id="v-co2">—<span class="unit"> ppm</span></span>
+      <span class="marrow" id="ar-co2">▸</span>
+    </div>
+    <div class="mchart" id="c-co2" style="display:none"><canvas id="ch-co2"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <div class="prow">
+      <label for="rangeSel">Период:</label>
+      <select id="rangeSel" onchange="setRange()">
+        <option value="1440" selected>12 часов</option>
+        <option value="5760">2 суток</option>
+        <option value="14400">5 суток</option>
+        <option value="20000">Максимум (~14 суток)</option>
+      </select>
+    </div>
+    <div class="prow pbtns">
+      <button class="btn sec" onclick="loadCharts()">Обновить</button>
+      <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
+    </div>
   </div>
 </div>
 
 <div class="tab" id="tab-wifi">
   <div class="panel">
     <h2>Подключение к домашней сети (STA)</h2>
-    <p style="color:var(--mut);font-size:13px;margin-bottom:12px">После подключения устройство перезагрузится и выйдет в интернет через роутер. Точка доступа <b>CO2Monitor</b> остаётся резервным режимом, если сеть недоступна.</p>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px">После подключения устройство перезагрузится и выйдет в интернет через роутер. Точка доступа <b>CO2Monitor</b> остаётся резервным режимом, если сеть недоступна.<br>Если сохранённой сети нет (сразу после прошивки), устройство само попробует подключиться к сети по умолчанию.</p>
     <div class="row">
       <input type="text" id="wssid" placeholder="SSID сети">
       <input type="password" id="wpass" placeholder="Пароль">
@@ -353,7 +553,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 <div class="tab" id="tab-calib">
   <div class="panel">
     <h2>Ручная калибровка MH-Z19</h2>
-    <p style="color:var(--mut);font-size:13px;margin-bottom:12px"><b>Zero calibration (400 ppm)</b> — вынесите датчик на свежий воздух на 20 минут, затем нажмите. Требуется прогреддатчика ≥ 48 часов.<br><b>Span calibration (2000 ppm)</b> — с эталонным газом 2000 ppm.</p>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px"><b>Zero calibration (400 ppm)</b> — вынесите датчик на свежий воздух на 20 минут, затем нажмите. Требуется прогрев датчика ≥ 48 часов.<br><b>Span calibration (2000 ppm)</b> — с эталонным газом 2000 ppm.</p>
     <div class="row">
       <button class="btn" onclick="calibrate('zero')">Cal Zero (400 ppm)</button>
       <button class="btn" onclick="calibrate('span')">Cal Span (2000 ppm)</button>
@@ -371,6 +571,22 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 
 <div class="tab" id="tab-data">
   <div class="panel">
+    <h2>Настройки записи</h2>
+    <div class="prow">
+      <label>Точка в память (сек):</label>
+      <input type="number" id="setPointSec" min="5" max="600" step="5">
+    </div>
+    <div class="prow" style="margin-top:10px">
+      <label>Сохранение в файл (мин):</label>
+      <input type="number" id="setSaveMin" min="1" max="1440" step="1">
+    </div>
+    <div class="prow pbtns">
+      <button class="btn" onclick="saveSettings()">Сохранить</button>
+    </div>
+    <div id="setmsg" style="font-size:13px;color:var(--ok);min-height:18px;margin-top:8px"></div>
+    <p style="color:var(--mut);font-size:12px">Точки в память попадают в графики (плавная линия), но не пишутся во flash. В файл сохраняются реже — для длительной истории.</p>
+  </div>
+  <div class="panel">
     <h2>Файлы логов (LittleFS)</h2>
     <div id="files" style="font-size:13px;color:var(--mut)">—</div>
     <div class="row" style="margin-top:12px">
@@ -382,21 +598,97 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 
 </main>
 <script>
-let charts={}, hist=[], liveData=[];
+let hist=[];
+let lastSeq=-1;   // счётчик точек, полученный от устройства
+let currentTab='live';
 const $=id=>document.getElementById(id);
-function showTab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
+
+// ---------- сохранение состояния интерфейса в браузере ----------
+const LS_KEY='co2mon.ui';
+function saveUi(){
+ try{ localStorage.setItem(LS_KEY, JSON.stringify(
+   {open:openCharts, range:$('rangeSel').value, tab:currentTab})); }catch(e){}
+}
+function loadUi(){
+ try{
+  const u=JSON.parse(localStorage.getItem(LS_KEY)||'{}');
+  if(u.range && $('rangeSel').querySelector('option[value="'+u.range+'"]')) $('rangeSel').value=u.range;
+  if(u.open) for(const k in MET){
+   openCharts[k]=!!u.open[k];
+   $(MET[k].box).style.display=openCharts[k]?'block':'none';
+   $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
+  }
+  if(u.tab) showTab(u.tab);
+ }catch(e){}
+}
+function setRange(){ saveUi(); loadCharts(); }
+
+function showTab(t){currentTab=t;
+document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
 $('tab-'+t).classList.add('active');
 document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
-if(t==='charts')loadCharts(); if(t==='data')loadData(); if(t==='calib')loadStatus();}
+if(t==='data'){loadData();loadSettings();} if(t==='calib')loadStatus();
+if(t==='live')drawAll();
+saveUi();}
 
-function mkChart(id,color,label,data,yfield){
- const ctx=$(id).getContext('2d');
- if(charts[id])charts[id].destroy();
- charts[id]=new Chart(ctx,{type:'line',data:{labels:data.map(d=>d.dt.slice(5)),
- datasets:[{label:label,data:data.map(d=>d[yfield]),borderColor:color,backgroundColor:color+'22',
- tension:.25,pointRadius:0,fill:true}]},
- options:{responsive:true,animation:false,scales:{x:{ticks:{maxTicksLimit:12,color:'#94a3b8'},grid:{color:'#334155'}},
- y:{ticks:{color:'#94a3b8'},grid:{color:'#334155'}}},plugins:{legend:{display:false}}}});}
+// показатели главной вкладки: id canvas, цвет, подпись, поле данных
+const MET={
+ t:{cv:'ch-t',box:'c-t',ar:'ar-t',color:'#f59e0b',label:'Температура, °C',field:'t'},
+ h:{cv:'ch-h',box:'c-h',ar:'ar-h',color:'#38bdf8',label:'Влажность, %',field:'h'},
+ co2:{cv:'ch-co2',box:'c-co2',ar:'ar-co2',color:'#22c55e',label:'CO₂, ppm',field:'co2'}
+};
+let openCharts={t:false,h:false,co2:false};   // каждый график свёрнут по умолчанию
+
+function drawOne(k){const m=MET[k];if(!m)return;drawChart(m.cv,m.color,m.label,hist,m.field);}
+function drawAll(){for(const k in MET)if(openCharts[k])drawOne(k);}
+
+function toggleChart(k){
+ openCharts[k]=!openCharts[k];
+ $(MET[k].box).style.display=openCharts[k]?'block':'none';
+ $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
+ if(openCharts[k]){drawOne(k);loadCharts();}   // сразу из кэша, затем свежие данные
+ saveUi();
+}
+
+// встроенный график на canvas (без Chart.js, работает без интернета)
+function drawChart(id,color,label,data,yfield){
+ const cv=$(id); if(!cv)return;
+ // адаптивная высота: на телефоне ниже, чтобы график влезал в экран
+ const h=window.innerWidth<760?190:280;
+ cv.style.height=h+'px';
+ const dpr=window.devicePixelRatio||1;
+ const w=Math.max(160,cv.clientWidth||600);
+ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr);
+ const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+ const pad={l:44,r:10,t:16,b:24};
+ const vals=data.map(d=>Number(d[yfield])||0);
+ let min=Math.min(...vals), max=Math.max(...vals);
+ if(!isFinite(min)||!isFinite(max)){min=0;max=1;}
+ if(min===max){min-=1;max+=1;}
+ const pw=w-pad.l-pad.r, ph=h-pad.t-pad.b;
+ g.lineWidth=1; g.strokeStyle='#334155'; g.fillStyle='#94a3b8'; g.font='11px sans-serif';
+ for(let i=0;i<=4;i++){
+  const y=pad.t+ph*i/4;
+  g.beginPath(); g.moveTo(pad.l,y); g.lineTo(w-pad.r,y); g.stroke();
+  const v=max-(max-min)*i/4; g.fillText(v.toFixed(1),4,y+4);
+ }
+ if(data.length){
+  const f=String(data[0].dt||'').slice(5), l=String(data[data.length-1].dt||'').slice(5);
+  g.fillText(f,pad.l,h-8);
+  g.fillText(l,w-pad.r-g.measureText(l).width,h-8);
+  g.beginPath(); g.strokeStyle=color; g.lineWidth=2;
+  data.forEach((d,i)=>{
+   const x=pad.l+(data.length>1?pw*i/(data.length-1):pw/2);
+   const y=pad.t+ph*(1-(vals[i]-min)/(max-min));
+   i?g.lineTo(x,y):g.moveTo(x,y);
+  });
+  g.stroke();
+  g.lineTo(pad.l+pw,pad.t+ph); g.lineTo(pad.l,pad.t+ph); g.closePath();
+  g.fillStyle=color+'22'; g.fill();
+ }
+ g.fillStyle='#e2e8f0'; g.font='12px sans-serif';
+// g.fillText(label,pad.l,11);
+}
 
 async function api(u){const r=await fetch(u);return r.json();}
 
@@ -406,27 +698,25 @@ async function pollLive(){
   $('v-t').innerHTML=s.temperature.toFixed(1)+'<span class="unit"> °C</span>';
   $('v-h').innerHTML=s.humidity.toFixed(1)+'<span class="unit"> %</span>';
   $('v-co2').innerHTML=s.co2+'<span class="unit"> ppm</span>';
-  $('s-dht').innerHTML=s.dhtOk?'<span class="ok">DHT22 OK</span>':'<span class="bad">DHT22 нет связи</span>';
-  $('s-mhz').innerHTML=s.mhzOk?'<span class="ok">MH-Z19 OK</span>':'<span class="bad">MH-Z19 нет связи</span>';
-  $('v-next').innerHTML=s.nextLogInSec+'<span class="unit"> c</span>';
+  $('s-dht').innerHTML=s.dhtOk?'<span class="ok"></span>':'<span class="bad">DHT22 нет связи</span>';
+  $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
   $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip);
-  $('timeBadge').textContent='Показание: '+s.datetime;
-  liveData.push({dt:s.datetime.slice(11),t:s.temperature,h:s.humidity,co2:s.co2});
-  if(liveData.length>200)liveData.shift();
-  if(window.Chart&&$('tab-live').classList.contains('active'))
-    mkChart('liveChart','#38bdf8','CO2 live',[...hist.slice(-72),...liveData],'co2');
+  $('timeBadge').textContent='Дата: '+s.datetime;
+  // как только на устройстве появилась новая точка — обновляем графики
+  if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(); }
  }catch(e){}
  setTimeout(pollLive,5000);}
 
+let chartsTimer=null;
 async function loadCharts(){
  try{
   hist=await api('/api/history?points='+$('rangeSel').value);
-  if(!window.Chart){$('tab-charts').insertAdjacentHTML('afterend','');alert('Chart.js не загружен (нет интернета). Данные доступны как CSV.');}
-  mkChart('chCo2','#22c55e','CO₂ ppm',hist,'co2');
-  mkChart('chT','#f59e0b','Температура',hist,'t');
-  mkChart('chH','#38bdf8','Влажность',hist,'h');
+  drawAll();
   $('logBadge').textContent='Точек: '+hist.length;
  }catch(e){}}
+
+// страховочное обновление раз в 2 мин (основное — по счётчику новых точек)
+function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(loadCharts,120000); }
 
 async function loadData(){
  try{
@@ -462,8 +752,24 @@ async function clearLogs(){
  const r=await fetch('/api/logs/clear',{method:'POST'});
  alert(await r.text());loadData();}
 
+async function loadSettings(){
+ try{const s=await api('/api/settings');
+  $('setPointSec').value=s.pointSec; $('setSaveMin').value=s.saveMin;
+  $('setPointSec').min=s.minPointSec; $('setPointSec').max=s.maxPointSec;
+  $('setSaveMin').min=s.minSaveMin; $('setSaveMin').max=s.maxSaveMin;
+ }catch(e){}}
+
+async function saveSettings(){
+ const b=new URLSearchParams({pointSec:$('setPointSec').value,saveMin:$('setSaveMin').value});
+ const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
+ $('setmsg').textContent=await r.text(); loadCharts();}
+
 function exportCsv(){location.href='/api/export';}
+window.addEventListener('resize',drawAll);
+loadUi();
 pollLive();
+loadCharts();
+startChartsLive();
 </script>
 </body>
 </html>)rawliteral";
@@ -481,8 +787,40 @@ static void setupWeb() {
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *req) {
     int points = 720;
     if (req->hasParam("points")) points = req->getParam("points")->value().toInt();
-    points = constrain(points, 10, 2000);
+    points = constrain(points, 10, 20000);
     req->send(200, "application/json", jsonHistory(points));
+  });
+
+  // -------- Настройки периодов записи --------
+  server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
+    JsonDocument doc;
+    doc["pointSec"] = pointIntervalMs / 1000;
+    doc["saveMin"] = saveIntervalMs / 60000;
+    doc["minPointSec"] = MIN_POINT_SEC;
+    doc["maxPointSec"] = MAX_POINT_SEC;
+    doc["minSaveMin"] = MIN_SAVE_MIN;
+    doc["maxSaveMin"] = MAX_SAVE_MIN;
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+  });
+
+  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *req) {
+    if (req->hasParam("pointSec", true)) {
+      int v = req->getParam("pointSec", true)->value().toInt();
+      v = constrain(v, MIN_POINT_SEC, MAX_POINT_SEC);
+      pointIntervalMs = (uint32_t)v * 1000UL;
+      prefs.putUInt("psec", (uint32_t)v);
+    }
+    if (req->hasParam("saveMin", true)) {
+      int v = req->getParam("saveMin", true)->value().toInt();
+      v = constrain(v, MIN_SAVE_MIN, MAX_SAVE_MIN);
+      saveIntervalMs = (uint32_t)v * 60000UL;
+      prefs.putUInt("smin", (uint32_t)v);
+    }
+    Serial.printf("[CFG] период точки: %lu с, сохранение: %lu мин\n",
+                  pointIntervalMs / 1000, saveIntervalMs / 60000);
+    req->send(200, "text/plain", "Сохранено");
   });
 
   server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -516,6 +854,7 @@ static void setupWeb() {
     if (ssid.length()) {
       prefs.putString("ssid", ssid);
       prefs.putString("pass", pass);
+      prefs.putBool("noauto", false);
       req->send(200, "text/plain", "Сохранено. Перезагрузка в STA-режим...");
       delay(1500);
       ESP.restart();
@@ -526,6 +865,7 @@ static void setupWeb() {
 
   server.on("/api/wifi/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
     prefs.clear();
+    prefs.putBool("noauto", true);   // не возвращаться к сети по умолчанию
     req->send(200, "text/plain", "Настройки стёрты. Возврат в AP...");
     delay(1500);
     ESP.restart();
@@ -569,8 +909,7 @@ static void setupWeb() {
     req->send(200, "application/json", out);
   });
 
-  server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
-    std::vector<String> names;
+  server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *req) {    std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (auto &n : names) LittleFS.remove(n);
     req->send(200, "text/plain", "Логи удалены");
@@ -583,6 +922,14 @@ static void setupWeb() {
 static void setupNetwork() {
   cfgSsid = prefs.getString("ssid", "");
   cfgPass = prefs.getString("pass", "");
+  // Нет сохранённой сети и автоподключение не выключено («Забыть сеть») —
+  // подставляем сеть по умолчанию (полезно сразу после прошивки).
+  if (cfgSsid.length() == 0 && !prefs.getBool("noauto", false)) {
+    cfgSsid = DEFAULT_WIFI_SSID;
+    cfgPass = DEFAULT_WIFI_PASS;
+    Serial.printf("[NET] сохранённой сети нет — пробую сеть по умолчанию: %s\n",
+                  DEFAULT_WIFI_SSID);
+  }
 
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
@@ -605,48 +952,70 @@ static void setupNetwork() {
     WiFi.softAP(AP_SSID, AP_PASS);
     apMode = true;
   }
+  // сразу пробуем синхронизировать NTP при наличии сети
+  lastNtpTry = 0;
+  tryNtp();
 
+  // DNS-редирект (captive portal) — AP работает всегда, поэтому запускаем DNS
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  dnsStarted = true;
   if (apMode) {
-    dnsServer.start(53, "*", WiFi.softAPIP());
     Serial.printf("[NET] AP: %s  http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   }
 }
-
 // ----------------------------- SETUP / LOOP -----------------------------
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== CO2 Monitor ESP32-S2 ===");
+  Serial.println("\n=== Climat Monitor ===");
 
   prefs.begin("cfg", false);
+
+  // периоды точек/сохранения (настраиваются в веб-интерфейсе)
+  {
+    uint32_t ps = prefs.getUInt("psec", DEFAULT_POINT_SEC);
+    uint32_t sm = prefs.getUInt("smin", DEFAULT_SAVE_MIN);
+    if (ps < MIN_POINT_SEC || ps > MAX_POINT_SEC) ps = DEFAULT_POINT_SEC;
+    if (sm < MIN_SAVE_MIN || sm > MAX_SAVE_MIN) sm = DEFAULT_SAVE_MIN;
+    pointIntervalMs = ps * 1000UL;
+    saveIntervalMs = sm * 60000UL;
+  }
 
   if (!LittleFS.begin(true)) {
     Serial.println("[FS] LittleFS отформатирован");
   }
   if (!LittleFS.exists(LOGS_DIR)) LittleFS.mkdir(LOGS_DIR);
 
-  // DHT22
-  dht.setType(22);
+  // DHT22 / AM2320 (однопроводный режим)
+  dht.begin();
 
-  // MH-Z19
-  mhzSerial.begin(9600);
+  // MH-Z19 (аппаратный UART на тех же пинах)
+  mhzSerial.begin(9600, SERIAL_8N1, MHZ_RX, MHZ_TX);
   mhz.begin(mhzSerial);
   mhz.setFilter(true, false);            // скользящее среднее
   mhz.setRange(5000);
   mhz.autoCalibration(prefs.getBool("abc", true), 24);
+  mhzRange = mhz.getRange();             // читаем один раз, чтобы не дёргать датчик каждые 5 с
+  Serial.printf("[MHZ] UART1 rx=%d tx=%d, range=%d, ABC=%d, err=%u\n",
+                MHZ_RX, MHZ_TX, mhzRange,
+                prefs.getBool("abc", true) ? 1 : 0, mhz.errorCode);
   delay(3000);                           // прогрев
 
   setupNetwork();
   setupWeb();
 
-  // первая точка сразу, дальше — каждые 10 минут
+  // первая точка сразу; далее по настроенным интервалам
   readSensors();
+  latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
   lastLogMs = millis();
+  lastPointMs = millis();
+  Serial.printf("[INIT] точка каждые %lu с, сохранение в файл каждые %lu мин\n",
+                pointIntervalMs / 1000, saveIntervalMs / 60000);
   Serial.println("[INIT] готово");
 }
 
 void loop() {
-  dnsServer.processNextRequest();
+  if (dnsStarted) dnsServer.processNextRequest();
 
   // чтение датчиков раз в 5 секунд
   static uint32_t lastRead = 0;
@@ -656,10 +1025,17 @@ void loop() {
     tryNtp();
   }
 
-  // запись каждые 10 минут
-  if (millis() - lastLogMs >= LOG_INTERVAL_MS) {
+  // промежуточная точка в RAM (для графиков)
+  if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
+    lastPointMs = millis();
+    latest.timestamp = (uint32_t)time(nullptr);
+    if (dhtOk || mhzOk) pushLivePoint(latest);
+  }
+
+  // сохранение точки в файл (реже, чтобы не изнашивать flash)
+  if (millis() - lastLogMs >= saveIntervalMs) {
     lastLogMs = millis();
-    latest.timestamp = timeSynced ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000);
+    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
     if (dhtOk || mhzOk) logReading(latest);
   }
 

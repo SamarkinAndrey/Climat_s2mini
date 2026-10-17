@@ -79,8 +79,8 @@ static String fmtTime(uint32_t ts) {
   struct tm t;
   time_t    tt = ts;
   localtime_r(&tt, &t);
-  char buf[20];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &t);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
   return String(buf);
 }
 
@@ -351,8 +351,9 @@ static String jsonHistory(int points) {
       int           p2 = ln.indexOf(',', p1 + 1);
       int           p3 = ln.indexOf(',', p2 + 1);
       int           p4 = ln.indexOf(',', p3 + 1);
-      o["ts"]          = ln.substring(0, p1).toInt();
-      o["dt"]          = ln.substring(p1 + 1, p2);
+      uint32_t ts      = (uint32_t)ln.substring(0, p1).toInt();
+      o["ts"]          = ts;
+      o["dt"]          = (ts > 1000000) ? fmtTime(ts) : ln.substring(p1 + 1, p2);
       o["t"]           = ln.substring(p2 + 1, p3).toFloat();
       o["h"]           = ln.substring(p3 + 1, p4).toFloat();
       o["co2"]         = ln.substring(p4 + 1).toInt();
@@ -659,7 +660,7 @@ function drawChart(id,color,label,data,yfield){
   const v=max-(max-min)*i/4; g.fillText(v.toFixed(1),4,y+4);
  }
  if(data.length){
-  const f=String(data[0].dt||'').slice(5), l=String(data[data.length-1].dt||'').slice(5);
+  const f=String(data[0].dt||'').slice(5,16), l=String(data[data.length-1].dt||'').slice(5,16);
   g.fillText(f,pad.l,h-8);
   g.fillText(l,w-pad.r-g.measureText(l).width,h-8);
   g.beginPath(); g.strokeStyle=color; g.lineWidth=2;

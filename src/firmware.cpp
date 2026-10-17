@@ -1,110 +1,83 @@
-// ============================================================
-//  Прошивка для ESP32-S2 mini (WEMOS LOLIN S2 MINI)
-//  DHT22 (t/rH) + MH-Z19B (CO2), сохранение каждые 10 мин,
-//  калибровка MH-Z19, AP/STA режимы, веб-интерфейс с графиками.
-//
-//  Подключение (пины согласованы с проектом greenhouse):
-//    DHT22 DATA -> GPIO 5   (+ подтяжка к 3.3V)   [greenhouse: DHT_PIN 5]
-//    MH-Z19 RX  -> GPIO 16 (TX ESP32)
-//    MH-Z19 TX  -> GPIO 17 (RX ESP32)
-//    MH-Z19 Vin -> 5V (VBUS), GND -> GND
-//
-//  Сборка: pio run -e lolin_s2_mini -t upload
-//  Веб-страница: http://192.168.4.1 (AP) или IP из роутера (STA)
-// ============================================================
-
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <vector>
-#include <algorithm>
 #include <AsyncTCP.h>
+#include <DHT.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <MHZ19.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <DHT.h>
+#include <algorithm>
+#include <vector>
 
-// ----------------------------- НАСТРОЙКИ -----------------------------
-// --- Пины (как в проекте greenhouse / Piranha ESP32) ---
-#define DHT_PIN 5        // DHT22 data pin  (greenhouse: DHT_PIN 5)
-#define DHT_TYPE 22      // тип датчика     (greenhouse: DHT_TYPE 22)
-#define MHZ_RX 17        // MH-Z19 TX -> GPIO17 (UART, у нас свой)
-#define MHZ_TX 16        // MH-Z19 RX <- GPIO16 (UART, у нас свой)
-#define LOGS_DIR "/logs"
-#define MAX_LOG_FILES 20                         // ротация старых файлов
-#define NTP_SERVER "ru.pool.ntp.org"
+#define DHT_PIN       5
+#define DHT_TYPE      22
+#define MHZ_RX        17
+#define MHZ_TX        16
+#define LOGS_DIR      "/logs"
+#define MAX_LOG_FILES 20
+#define NTP_SERVER    "ru.pool.ntp.org"
 
-// --- Запись точек ---
-// Промежуточные точки держим в RAM (кольцевой буфер) для плавных графиков,
-// а в файл пишем реже — чтобы не изнашивать flash и не раздувать логи.
-#define DEFAULT_POINT_SEC 30                     // период промежуточной точки, сек
-#define DEFAULT_SAVE_MIN  5                      // период сохранения в файл, мин
+#define DEFAULT_POINT_SEC 30
+#define DEFAULT_SAVE_MIN  5
 #define MIN_POINT_SEC     5
 #define MAX_POINT_SEC     600
 #define MIN_SAVE_MIN      1
 #define MAX_SAVE_MIN      1440
-#define MAX_LIVE_POINTS   1440                   // буфер RAM: 12 ч при 30 с
-#define MAX_HISTORY_OUT   400                    // максимум точек в ответе /api/history
+#define MAX_LIVE_POINTS   1440
+#define MAX_HISTORY_OUT   800
 
 const char *AP_SSID = "CO2Monitor";
-const char *AP_PASS = "12345678";  // минимум 8 символов
+const char *AP_PASS = "12345678";
 
-// --- Сеть по умолчанию ---
-// Используется для автоподключения, если в памяти нет сохранённой сети
-// (например, после первой прошивки или полного стирания flash).
-// Кнопка «Забыть сеть» в веб-интерфейсе отключает это автоподключение.
 #define DEFAULT_WIFI_SSID "Andrey_Lan"
 #define DEFAULT_WIFI_PASS "2p0r1o8w"
 
-// ----------------------------- ОБЪЕКТЫ -----------------------------
 DHT dht(DHT_PIN, DHT_TYPE);
-// Аппаратный UART (как в greenhouse) — надёжнее SoftwareSerial на ESP32 при работающем Wi-Fi
-HardwareSerial mhzSerial(1);
-MHZ19 mhz;
-Preferences prefs;
-AsyncWebServer server(80);
-DNSServer dnsServer;
-bool dnsStarted = false;   // DNS-сервер запущен только когда реально нужен (AP)
 
-// ----------------------------- СОСТОЯНИЕ -----------------------------
+HardwareSerial mhzSerial(1);
+MHZ19          mhz;
+Preferences    prefs;
+AsyncWebServer server(80);
+DNSServer      dnsServer;
+bool           dnsStarted = false;
+
 struct Reading {
-  uint32_t timestamp = 0;  // unix time (если есть NTP), иначе millis/1000
-  float temperature = 0;
-  float humidity = 0;
-  uint16_t co2 = 0;
+  uint32_t timestamp   = 0;
+  float    temperature = 0;
+  float    humidity    = 0;
+  uint16_t co2         = 0;
 };
 
-Reading latest;
-bool dhtOk = false, mhzOk = false;
-uint32_t lastLogMs = 0;
-uint32_t lastNtpTry = 0;
-uint32_t lastPointMs = 0;                       // время последней промежуточной точки
-bool apMode = true;   // текущий режим сети
-bool timeSynced = false;
-uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;      // период точек в RAM
-uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL; // период записи в файл
-uint32_t pointsSeq = 0;   // счётчик точек (меняется при каждой новой точке)
+Reading  latest;
+bool     dhtOk = false, mhzOk = false;
+uint32_t lastLogMs       = 0;
+uint32_t lastNtpTry      = 0;
+uint32_t lastPointMs     = 0;
+bool     apMode          = true;
+bool     timeSynced      = false;
+uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;
+uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL;
+uint32_t pointsSeq       = 0;
 
-// --- Кольцевой буфер промежуточных точек (в RAM, для графиков) ---
 struct Point {
   uint32_t ts;
-  float t;
-  float h;
+  float    t;
+  float    h;
   uint16_t co2;
 };
+
 Point liveBuf[MAX_LIVE_POINTS];
-int liveHead = 0;    // индекс следующей записи
-int liveCount = 0;   // сколько точек валидно
+int   liveHead  = 0;
+int   liveCount = 0;
 
 String cfgSsid, cfgPass;
-int mhzRange = 5000;   // диапазон MH-Z19 (читается один раз при старте)
+int    mhzRange = 5000;
 
-// ----------------------------- УТИЛИТЫ -----------------------------
 static String fmtTime(uint32_t ts) {
   struct tm t;
-  time_t tt = ts;
+  time_t    tt = ts;
   localtime_r(&tt, &t);
   char buf[20];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &t);
@@ -112,30 +85,30 @@ static String fmtTime(uint32_t ts) {
 }
 
 static String todayFile() {
-  time_t now = time(nullptr);
+  time_t    now = time(nullptr);
   struct tm t;
   if (timeSynced && now > 1000000) {
     localtime_r(&now, &t);
   } else {
     struct tm fallback;
     memset(&fallback, 0, sizeof(fallback));
-    fallback.tm_year = 100; // 2000
-    fallback.tm_mon = 0;
+    fallback.tm_year = 100;
+    fallback.tm_mon  = 0;
     fallback.tm_mday = 1;
-    t = fallback;
+    t                = fallback;
   }
   char name[32];
   sprintf(name, "%s/%04d-%02d-%02d.csv", LOGS_DIR, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
   return String(name);
 }
 
-// ----------------------------- ЛОГИРОВАНИЕ -----------------------------
-// Собирает список файлов в директории (имена с полным путём)
 static void listFiles(const char *dirPath, std::vector<String> &out) {
   File dir = LittleFS.open(dirPath);
-  if (!dir || !dir.isDirectory()) return;
+  if (!dir || !dir.isDirectory())
+    return;
   for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
-    if (!entry.isDirectory()) out.push_back(String(entry.name()));
+    if (!entry.isDirectory())
+      out.push_back(String(entry.name()));
     entry.close();
   }
   dir.close();
@@ -145,96 +118,92 @@ static void rotateLogsIfNeeded() {
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
 
-  // имена вида /logs/YYYY-MM-DD.csv сортируются лексикографически по дате
   while (names.size() > MAX_LOG_FILES) {
     int oldestIdx = 0;
     for (size_t i = 1; i < names.size(); i++)
-      if (names[i] < names[oldestIdx]) oldestIdx = i;
+      if (names[i] < names[oldestIdx])
+        oldestIdx = i;
     Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
   }
 }
+
 static void logReading(const Reading &r) {
-  if (!LittleFS.exists(LOGS_DIR)) LittleFS.mkdir(LOGS_DIR);
+  if (!LittleFS.exists(LOGS_DIR))
+    LittleFS.mkdir(LOGS_DIR);
   if (!timeSynced || (time(nullptr) < 1000000)) {
     Serial.println("[LOG] время не синхронизировано (NTP), пропускаю запись в файл");
     return;
   }
-  String path = todayFile();
-  bool isNew = !LittleFS.exists(path);
+  String path  = todayFile();
+  bool   isNew = !LittleFS.exists(path);
 
   File f = LittleFS.open(path, "a");
   if (!f) {
     Serial.println("[LOG] ошибка открытия файла");
     return;
   }
-  if (isNew) f.println("timestamp,datetime,temperature,humidity,co2");
+  if (isNew)
+    f.println("timestamp,datetime,temperature,humidity,co2");
   f.printf("%lu,%s,%.2f,%.2f,%u\n", r.timestamp, fmtTime(r.timestamp).c_str(),
            r.temperature, r.humidity, r.co2);
   f.close();
-  pointsSeq++;   // появилась новая сохранённая точка
+  pointsSeq++;
   Serial.printf("[LOG] записано в %s: %.1fC %.1f%% %uppm\n",
                 path.c_str(), r.temperature, r.humidity, r.co2);
   rotateLogsIfNeeded();
 }
 
-// Промежуточная точка в RAM (для плавных графиков, без записи во flash)
 static void pushLivePoint(const Reading &r) {
   Point &p = liveBuf[liveHead];
-  p.ts = r.timestamp;
-  p.t = r.temperature;
-  p.h = r.humidity;
-  p.co2 = r.co2;
+  p.ts     = r.timestamp;
+  p.t      = r.temperature;
+  p.h      = r.humidity;
+  p.co2    = r.co2;
   liveHead = (liveHead + 1) % MAX_LIVE_POINTS;
-  if (liveCount < MAX_LIVE_POINTS) liveCount++;
+  if (liveCount < MAX_LIVE_POINTS)
+    liveCount++;
   pointsSeq++;
 }
 
-// ----------------------------- ДАТЧИКИ -----------------------------
 static void readSensors() {
-  // Adafruit DHT (как в greenhouse) — дольше держит пробуждение (20 мс),
-  // что нужно для AM2320 в однопроводном режиме
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  bool ok = !isnan(t) && !isnan(h);
+  float t  = dht.readTemperature();
+  float h  = dht.readHumidity();
+  bool  ok = !isnan(t) && !isnan(h);
   if (ok) {
     latest.temperature = t;
-    latest.humidity = h;
+    latest.humidity    = h;
   }
-  // логируем при смене статуса, чтобы видеть причину в мониторе
+
   static int lastOk = -1;
   if ((int)ok != lastOk) {
     lastOk = ok;
-    if (ok) Serial.printf("[DHT] pin=%d OK, t=%.2f h=%.2f\n", DHT_PIN, t, h);
-    else    Serial.printf("[DHT] pin=%d нет отклика (NaN) — проверь питание/пин/подтяжку\n", DHT_PIN);
+    if (ok)
+      Serial.printf("[DHT] pin=%d OK, t=%.2f h=%.2f\n", DHT_PIN, t, h);
+    else
+      Serial.printf("[DHT] pin=%d нет отклика (NaN) — проверь питание/пин/подтяжку\n", DHT_PIN);
   }
   dhtOk = ok;
 
-  // --- MH-Z19 ---
-  // getCO2(isunLimited, force): false,true = запросить значение в пределах
-  // заданного диапазона (setRange(5000)).
-  int co2 = mhz.getCO2(false, true);
-  byte err = mhz.errorCode;   // снимаем сразу: getRange() перезаписывает errorCode
+  int  co2   = mhz.getCO2(false, true);
+  byte err   = mhz.errorCode;
   bool co2ok = (co2 > 0 && co2 <= mhzRange);
 
-  // одиночный сбойный кадр (CRC/таймаут/фильтр) не должен сразу давать
-  // «нет связи» — статус падает только после 3 подряд неудачных чтений
-  static int co2Fail = 0;
+  static int  co2Fail = 0;
   static byte lastErr = 0xFF;
   if (co2ok) {
-    co2Fail = 0;
+    co2Fail    = 0;
     latest.co2 = co2;
-    mhzOk = true;
+    mhzOk      = true;
   } else if (err == RESULT_FILTER) {
-    // датчик ответил; библиотека отбраковала значение (кратковременный
-    // сброс ABC к 410 ppm) — это не потеря связи, оставляем последнее значение
     co2Fail = 0;
   } else {
-    if (co2Fail < 100) co2Fail++;
-    if (co2Fail >= 3) mhzOk = false;
+    if (co2Fail < 100)
+      co2Fail++;
+    if (co2Fail >= 3)
+      mhzOk = false;
   }
-
   if (err != lastErr) {
     lastErr = err;
     if (co2ok)
@@ -245,18 +214,18 @@ static void readSensors() {
       Serial.printf("[MHZ] ошибка чтения, код %u (1=OK 2=timeout 3=match 4=crc 5=filter), сбоев подряд: %d\n",
                     err, co2Fail);
   }
-
   latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
 }
 
-// ----------------------------- NTP -----------------------------
 static void tryNtp() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
   unsigned long now = millis();
-  // не блокируем, пробуем раз в 10 сек, проверяем синхронизацию
-  if (now - lastNtpTry < 10000) return;
+
+  if (now - lastNtpTry < 10000)
+    return;
   lastNtpTry = now;
-  configTime(3 * 3600, 0, NTP_SERVER);  // MSK +3
+  configTime(3 * 3600, 0, NTP_SERVER);
   time_t tt = time(nullptr);
   if (tt > 1000000 && !timeSynced) {
     timeSynced = true;
@@ -266,53 +235,54 @@ static void tryNtp() {
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     latest.timestamp = (uint32_t)tt;
-    logReading(latest);   // первую точку пишем сразу, не ждём интервала сохранения
+    logReading(latest);
     pushLivePoint(latest);
-    lastLogMs = millis();
+    lastLogMs   = millis();
     lastPointMs = millis();
   }
 }
 
-// ----------------------------- WEB: JSON -----------------------------
 static String jsonCurrent() {
   JsonDocument doc;
   doc["temperature"] = latest.temperature;
-  doc["humidity"] = latest.humidity;
-  doc["co2"] = latest.co2;
-  doc["dhtOk"] = dhtOk;
-  doc["mhzOk"] = mhzOk;
-  doc["timestamp"] = latest.timestamp;
+  doc["humidity"]    = latest.humidity;
+  doc["co2"]         = latest.co2;
+  doc["dhtOk"]       = dhtOk;
+  doc["mhzOk"]       = mhzOk;
+  doc["timestamp"]   = latest.timestamp;
   if (timeSynced && time(nullptr) > 1000000) {
     doc["datetime"] = fmtTime(latest.timestamp);
   } else {
     doc["datetime"] = "NTP ожидание...";
   }
-  doc["uptime"] = millis() / 1000;
-  doc["mode"] = apMode ? "AP" : "STA";
-  doc["ip"] = WiFi.localIP().toString();
+  doc["uptime"]       = millis() / 1000;
+  doc["mode"]         = apMode ? "AP" : "STA";
+  doc["ip"]           = WiFi.localIP().toString();
   doc["nextLogInSec"] = (timeSynced && time(nullptr) > 1000000)
                             ? ((lastLogMs + saveIntervalMs > millis())
                                    ? (lastLogMs + saveIntervalMs - millis()) / 1000
                                    : 0)
                             : 0;
-  doc["pointSec"] = pointIntervalMs / 1000;
-  doc["saveMin"] = saveIntervalMs / 60000;
-  doc["points"] = liveCount;
-  doc["pointsSeq"] = pointsSeq;
+  doc["pointSec"]     = pointIntervalMs / 1000;
+  doc["saveMin"]      = saveIntervalMs / 60000;
+  doc["points"]       = liveCount;
+  doc["pointsSeq"]    = pointsSeq;
   String out;
   serializeJson(doc, out);
   return out;
 }
 
 static String jsonHistory(int points) {
-  if (points < 1) points = 1;
-  if (points > 20000) points = 20000;
+  if (points < 1)
+    points = 1;
+  if (points > 20000)
+    points = 20000;
 
-  // ---- 1. промежуточные точки из RAM (высокое разрешение) ----
   std::vector<Point> live;
   live.reserve(liveCount);
   int first = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-  for (int i = 0; i < liveCount; i++) live.push_back(liveBuf[(first + i) % MAX_LIVE_POINTS]);
+  for (int i = 0; i < liveCount; i++)
+    live.push_back(liveBuf[(first + i) % MAX_LIVE_POINTS]);
   uint32_t oldestLive = live.empty() ? 0xFFFFFFFFu : live.front().ts;
 
   int fromFile = points - (int)live.size();
@@ -320,20 +290,22 @@ static String jsonHistory(int points) {
     live.erase(live.begin(), live.begin() + ((int)live.size() - points));
     fromFile = 0;
   }
-  if (fromFile > MAX_HISTORY_OUT) fromFile = MAX_HISTORY_OUT;
+  if (fromFile > MAX_HISTORY_OUT)
+    fromFile = MAX_HISTORY_OUT;
 
-  // ---- 2. старые точки из файлов (только то, что старше живой истории) ----
   std::vector<String> rows;
   if (fromFile > 0) {
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (size_t i = 0; i < names.size(); i++)
       for (size_t j = i + 1; j < names.size(); j++)
-        if (names[j] < names[i]) std::swap(names[i], names[j]);
+        if (names[j] < names[i])
+          std::swap(names[i], names[j]);
 
     for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < fromFile; fi--) {
       File f = LittleFS.open(names[fi], "r");
-      if (!f) continue;
+      if (!f)
+        continue;
       std::vector<String> fileRows;
       while (f.available()) {
         String line = f.readStringUntil('\n');
@@ -342,46 +314,47 @@ static String jsonHistory(int points) {
           fileRows.push_back(line);
       }
       f.close();
-      // берём строки, которые старше самой старой живой точки
+
       for (int i = (int)fileRows.size() - 1; i >= 0 && (int)rows.size() < fromFile; i--) {
         int c = fileRows[i].indexOf(',');
-        if (c <= 0) continue;
+        if (c <= 0)
+          continue;
         uint32_t ts = (uint32_t)fileRows[i].substring(0, c).toInt();
-        if (ts == 0 || ts >= oldestLive) continue;   // уже показано живыми точками
+        if (ts == 0 || ts >= oldestLive)
+          continue;
         rows.push_back(fileRows[i]);
       }
     }
-    std::reverse(rows.begin(), rows.end());   // к возрастанию времени
+    std::reverse(rows.begin(), rows.end());
   }
 
-  // ---- 3. объединяем и при необходимости прореживаем ----
   size_t total = rows.size() + live.size();
-  int step = (total > MAX_HISTORY_OUT) ? (int)((total + MAX_HISTORY_OUT - 1) / MAX_HISTORY_OUT) : 1;
+  int    step  = (total > MAX_HISTORY_OUT) ? (int)((total + MAX_HISTORY_OUT - 1) / MAX_HISTORY_OUT) : 1;
 
   JsonDocument doc;
-  JsonArray arr = doc.to<JsonArray>();
-  // шаг сдвигаем так, чтобы самая свежая точка всегда попадала в ответ
+  JsonArray    arr = doc.to<JsonArray>();
+
   int off = (total > 0) ? ((int)total - 1) % step : 0;
   for (int i = off; i < (int)total; i += step) {
     JsonObject o = arr.createNestedObject();
     if (i < (int)rows.size()) {
       const String &ln = rows[i];
-      int p1 = ln.indexOf(',');
-      int p2 = ln.indexOf(',', p1 + 1);
-      int p3 = ln.indexOf(',', p2 + 1);
-      int p4 = ln.indexOf(',', p3 + 1);
-      o["ts"] = ln.substring(0, p1).toInt();
-      o["dt"] = ln.substring(p1 + 1, p2);
-      o["t"] = ln.substring(p2 + 1, p3).toFloat();
-      o["h"] = ln.substring(p3 + 1, p4).toFloat();
-      o["co2"] = ln.substring(p4 + 1).toInt();
+      int           p1 = ln.indexOf(',');
+      int           p2 = ln.indexOf(',', p1 + 1);
+      int           p3 = ln.indexOf(',', p2 + 1);
+      int           p4 = ln.indexOf(',', p3 + 1);
+      o["ts"]          = ln.substring(0, p1).toInt();
+      o["dt"]          = ln.substring(p1 + 1, p2);
+      o["t"]           = ln.substring(p2 + 1, p3).toFloat();
+      o["h"]           = ln.substring(p3 + 1, p4).toFloat();
+      o["co2"]         = ln.substring(p4 + 1).toInt();
     } else {
       const Point &p = live[i - rows.size()];
-      o["ts"] = p.ts;
-      o["dt"] = fmtTime(p.ts);
-      o["t"] = p.t;
-      o["h"] = p.h;
-      o["co2"] = p.co2;
+      o["ts"]        = p.ts;
+      o["dt"]        = fmtTime(p.ts);
+      o["t"]         = p.t;
+      o["h"]         = p.h;
+      o["co2"]       = p.co2;
     }
   }
 
@@ -391,21 +364,19 @@ static String jsonHistory(int points) {
 }
 
 static String listLogFiles() {
-  String out = "[";
+  String              out = "[";
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
   const int prefixLen = strlen(LOGS_DIR) + 1;
   for (size_t i = 0; i < names.size(); i++) {
-    if (i) out += ",";
+    if (i)
+      out += ",";
     out += "\"" + names[i].substring(prefixLen) + "\"";
   }
   out += "]";
   return out;
 }
 
-// ----------------------------- HTML (веб-интерфейс) -----------------------------
-// Графики рисуются встроенным canvas-рендерером (без Chart.js/CDN),
-// поэтому работают и без интернета; данные берутся из /api/history.
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -430,16 +401,12 @@ main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 .metric{padding:12px}
 .mhead{display:flex;align-items:baseline;gap:8px;cursor:pointer;-webkit-user-select:none;user-select:none}
 
-//.mlabel{font-size:21px;color:var(--mut)}
 .mlabel{font-size:21px;color:#fff}
 .mhead .status{font-size:12px;margin-left:6px}
 .mval{margin-left:auto;font-size:29px;font-weight:700;line-height:1.1;text-align:right}
 #v-t{color:#f59e0b}
 #v-h{color:#38bdf8}
 #v-co2{color:#22c55e}
-//.metric:nth-child(1) .mlabel{color:#f59e0b}
-//.metric:nth-child(2) .mlabel{color:#38bdf8}
-//.metric:nth-child(3) .mlabel{color:#22c55e}
 .marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
 .mchart{margin-top:10px}
 .prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
@@ -472,7 +439,6 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
  .metric{padding:16px}
  .mlabel{font-size:19px}
  .mval{font-size:36px}
- .mval .unit{font-size:18px}
  .mhead .status{font-size:13px}
  .panel{border-radius:16px;padding:18px;margin-bottom:16px}
  .panel h2{font-size:15px}
@@ -511,7 +477,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 
   <div class="panel metric">
     <div class="mhead" onclick="toggleChart('h')">
-      <span class="mlabel">Влажность<span class="status" id="s-dht"></span></span>
+      <span class="mlabel">Влажность</span>
       <span class="mval" id="v-h">—</span>
       <span class="marrow" id="ar-h">▸</span>
     </div>
@@ -530,12 +496,14 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
   <div class="panel">
     <div class="prow">
       <label for="rangeSel">Период:</label>
-      <select id="rangeSel" onchange="setRange()">
-        <option value="1440" selected>12 часов</option>
-        <option value="5760">2 суток</option>
-        <option value="14400">5 суток</option>
-        <option value="20000">Максимум (~14 суток)</option>
-      </select>
+        <select id="rangeSel" onchange="setRange()">
+          <option value="6">6 часов</option>
+          <option value="12" selected>12 часов</option>
+          <option value="24">1 сутки</option>
+          <option value="48">2 суток</option>
+          <option value="120">5 суток</option>
+          <option value="0">Вся история</option>
+        </select>
     </div>
     <div class="prow pbtns">
       <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
@@ -606,11 +574,10 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
 </main>
 <script>
 let hist=[];
-let lastSeq=-1;   // счётчик точек, полученный от устройства
+let lastSeq=-1;  
 let currentTab='live';
 const $=id=>document.getElementById(id);
 
-// ---------- сохранение состояния интерфейса в браузере ----------
 const LS_KEY='co2mon.ui';
 function saveUi(){
  try{ localStorage.setItem(LS_KEY, JSON.stringify(
@@ -638,13 +605,12 @@ if(t==='data'){loadData();loadSettings();} if(t==='calib')loadStatus();
 if(t==='live')drawAll();
 saveUi();}
 
-// показатели главной вкладки: id canvas, цвет, подпись, поле данных
 const MET={
  t:{cv:'ch-t',box:'c-t',ar:'ar-t',color:'#f59e0b',label:'°C',field:'t'},
  h:{cv:'ch-h',box:'c-h',ar:'ar-h',color:'#38bdf8',label:'%',field:'h'},
  co2:{cv:'ch-co2',box:'c-co2',ar:'ar-co2',color:'#22c55e',label:'ppm',field:'co2'}
 };
-let openCharts={t:false,h:false,co2:false};   // каждый график свёрнут по умолчанию
+let openCharts={t:false,h:false,co2:false};  
 
 function drawOne(k){const m=MET[k];if(!m)return;drawChart(m.cv,m.color,m.label,hist,m.field);}
 function drawAll(){for(const k in MET)if(openCharts[k])drawOne(k);}
@@ -653,14 +619,13 @@ function toggleChart(k){
  openCharts[k]=!openCharts[k];
  $(MET[k].box).style.display=openCharts[k]?'block':'none';
  $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
- if(openCharts[k]){drawOne(k);loadCharts();}   // сразу из кэша, затем свежие данные
+ if(openCharts[k]){drawOne(k);loadCharts();}  
  saveUi();
 }
 
-// встроенный график на canvas (без Chart.js, работает без интернета)
 function drawChart(id,color,label,data,yfield){
  const cv=$(id); if(!cv)return;
- // адаптивная высота: на телефоне ниже, чтобы график влезал в экран
+
  const h=window.innerWidth<760?190:280;
  cv.style.height=h+'px';
  const dpr=window.devicePixelRatio||1;
@@ -709,7 +674,7 @@ async function pollLive(){
   $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
   $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip);
   $('timeBadge').textContent='Дата: '+s.datetime;
-  // как только на устройстве появилась новая точка — обновляем графики
+ 
   if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(); }
  }catch(e){}
  setTimeout(pollLive,5000);}
@@ -717,12 +682,17 @@ async function pollLive(){
 let chartsTimer=null;
 async function loadCharts(){
  try{
-  hist=await api('/api/history?points='+$('rangeSel').value);
+  hist=await api('/api/history?hours='+$('rangeSel').value);
   drawAll();
-  $('logBadge').textContent='Точек: '+hist.length;
+  let span='';
+  if(hist.length>1){
+   const t0=hist[0].ts, t1=hist[hist.length-1].ts;
+   const hours=Math.round((t1-t0)/3600);
+   span=hours>=24?(' · '+Math.round(hours/24)+' сут'):(' · '+hours+' ч');
+  }
+  $('logBadge').textContent='Точек: '+hist.length+span;
  }catch(e){}}
 
-// страховочное обновление раз в 2 мин (основное — по счётчику новых точек)
 function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(loadCharts,120000); }
 
 async function loadData(){
@@ -781,7 +751,6 @@ startChartsLive();
 </body>
 </html>)rawliteral";
 
-// ----------------------------- WEB СЕРВЕР -----------------------------
 static void setupWeb() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send_P(200, "text/html", INDEX_HTML);
@@ -793,20 +762,31 @@ static void setupWeb() {
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *req) {
     int points = 720;
-    if (req->hasParam("points")) points = req->getParam("points")->value().toInt();
+    if (req->hasParam("hours")) {
+      int hours = req->getParam("hours")->value().toInt();
+      if (hours <= 0) {
+        points = 20000;
+      } else {
+        uint32_t sec = (uint32_t)hours * 3600UL;
+        points       = (int)(sec / (pointIntervalMs / 1000UL));
+        if (points < 10)
+          points = 10;
+      }
+    } else if (req->hasParam("points")) {
+      points = req->getParam("points")->value().toInt();
+    }
     points = constrain(points, 10, 20000);
     req->send(200, "application/json", jsonHistory(points));
   });
 
-  // -------- Настройки периодов записи --------
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    doc["pointSec"] = pointIntervalMs / 1000;
-    doc["saveMin"] = saveIntervalMs / 60000;
+    doc["pointSec"]    = pointIntervalMs / 1000;
+    doc["saveMin"]     = saveIntervalMs / 60000;
     doc["minPointSec"] = MIN_POINT_SEC;
     doc["maxPointSec"] = MAX_POINT_SEC;
-    doc["minSaveMin"] = MIN_SAVE_MIN;
-    doc["maxSaveMin"] = MAX_SAVE_MIN;
+    doc["minSaveMin"]  = MIN_SAVE_MIN;
+    doc["maxSaveMin"]  = MAX_SAVE_MIN;
     String out;
     serializeJson(doc, out);
     req->send(200, "application/json", out);
@@ -814,14 +794,14 @@ static void setupWeb() {
 
   server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *req) {
     if (req->hasParam("pointSec", true)) {
-      int v = req->getParam("pointSec", true)->value().toInt();
-      v = constrain(v, MIN_POINT_SEC, MAX_POINT_SEC);
+      int v           = req->getParam("pointSec", true)->value().toInt();
+      v               = constrain(v, MIN_POINT_SEC, MAX_POINT_SEC);
       pointIntervalMs = (uint32_t)v * 1000UL;
       prefs.putUInt("psec", (uint32_t)v);
     }
     if (req->hasParam("saveMin", true)) {
-      int v = req->getParam("saveMin", true)->value().toInt();
-      v = constrain(v, MIN_SAVE_MIN, MAX_SAVE_MIN);
+      int v          = req->getParam("saveMin", true)->value().toInt();
+      v              = constrain(v, MIN_SAVE_MIN, MAX_SAVE_MIN);
       saveIntervalMs = (uint32_t)v * 60000UL;
       prefs.putUInt("smin", (uint32_t)v);
     }
@@ -835,19 +815,21 @@ static void setupWeb() {
   });
 
   server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req) {
-    // объединяем все csv в один ответ
-    String all = "timestamp,datetime,temperature,humidity,co2\n";
+    String              all = "timestamp,datetime,temperature,humidity,co2\n";
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (size_t i = 0; i < names.size(); i++)
       for (size_t j = i + 1; j < names.size(); j++)
-        if (names[j] < names[i]) std::swap(names[i], names[j]);
+        if (names[j] < names[i])
+          std::swap(names[i], names[j]);
     for (auto &n : names) {
       File f = LittleFS.open(n, "r");
-      if (!f) continue;
+      if (!f)
+        continue;
       while (f.available()) {
         String line = f.readStringUntil('\n');
-        if (!line.startsWith("timestamp")) all += line + "\n";
+        if (!line.startsWith("timestamp"))
+          all += line + "\n";
       }
       f.close();
     }
@@ -856,8 +838,10 @@ static void setupWeb() {
 
   server.on("/api/wifi/save", HTTP_POST, [](AsyncWebServerRequest *req) {
     String ssid, pass;
-    if (req->hasParam("ssid", true)) ssid = req->getParam("ssid", true)->value();
-    if (req->hasParam("pass", true)) pass = req->getParam("pass", true)->value();
+    if (req->hasParam("ssid", true))
+      ssid = req->getParam("ssid", true)->value();
+    if (req->hasParam("pass", true))
+      pass = req->getParam("pass", true)->value();
     if (ssid.length()) {
       prefs.putString("ssid", ssid);
       prefs.putString("pass", pass);
@@ -872,16 +856,16 @@ static void setupWeb() {
 
   server.on("/api/wifi/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
     prefs.clear();
-    prefs.putBool("noauto", true);   // не возвращаться к сети по умолчанию
+    prefs.putBool("noauto", true);
     req->send(200, "text/plain", "Настройки стёрты. Возврат в AP...");
     delay(1500);
     ESP.restart();
   });
 
-  // -------- КАЛИБРОВКА MH-Z19 --------
   server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest *req) {
     String type = "zero";
-    if (req->hasParam("type")) type = req->getParam("type")->value();
+    if (req->hasParam("type"))
+      type = req->getParam("type")->value();
 
     String resp;
     if (type == "zero") {
@@ -908,29 +892,29 @@ static void setupWeb() {
   server.on("/api/sensor", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
     doc["range"] = mhz.getRange();
-    doc["abc"] = mhz.getABC();
-    doc["co2"] = latest.co2;
+    doc["abc"]   = mhz.getABC();
+    doc["co2"]   = latest.co2;
     doc["mhzOk"] = mhzOk;
     String out;
     serializeJson(doc, out);
     req->send(200, "application/json", out);
   });
 
-  server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *req) {    std::vector<String> names;
+  server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
+    std::vector<String> names;
     listFiles(LOGS_DIR, names);
-    for (auto &n : names) LittleFS.remove(n);
+    for (auto &n : names)
+      LittleFS.remove(n);
     req->send(200, "text/plain", "Логи удалены");
   });
 
   server.begin();
 }
 
-// ----------------------------- СЕТЬ -----------------------------
 static void setupNetwork() {
   cfgSsid = prefs.getString("ssid", "");
   cfgPass = prefs.getString("pass", "");
-  // Нет сохранённой сети и автоподключение не выключено («Забыть сеть») —
-  // подставляем сеть по умолчанию (полезно сразу после прошивки).
+
   if (cfgSsid.length() == 0 && !prefs.getBool("noauto", false)) {
     cfgSsid = DEFAULT_WIFI_SSID;
     cfgPass = DEFAULT_WIFI_PASS;
@@ -948,29 +932,30 @@ static void setupNetwork() {
   if (cfgSsid.length()) {
     Serial.println("[NET] Пробую подключиться к: " + cfgSsid);
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS);       // AP остаётся как резерв
+    WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
+      delay(200);
     apMode = (WiFi.status() != WL_CONNECTED);
-    if (apMode) Serial.println("[NET] Не удалось, работаю в режиме точки доступа");
+    if (apMode)
+      Serial.println("[NET] Не удалось, работаю в режиме точки доступа");
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     apMode = true;
   }
-  // сразу пробуем синхронизировать NTP при наличии сети
+
   lastNtpTry = 0;
   tryNtp();
 
-  // DNS-редирект (captive portal) — AP работает всегда, поэтому запускаем DNS
   dnsServer.start(53, "*", WiFi.softAPIP());
   dnsStarted = true;
   if (apMode) {
     Serial.printf("[NET] AP: %s  http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   }
 }
-// ----------------------------- SETUP / LOOP -----------------------------
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -978,53 +963,52 @@ void setup() {
 
   prefs.begin("cfg", false);
 
-  // периоды точек/сохранения (настраиваются в веб-интерфейсе)
   {
     uint32_t ps = prefs.getUInt("psec", DEFAULT_POINT_SEC);
     uint32_t sm = prefs.getUInt("smin", DEFAULT_SAVE_MIN);
-    if (ps < MIN_POINT_SEC || ps > MAX_POINT_SEC) ps = DEFAULT_POINT_SEC;
-    if (sm < MIN_SAVE_MIN || sm > MAX_SAVE_MIN) sm = DEFAULT_SAVE_MIN;
+    if (ps < MIN_POINT_SEC || ps > MAX_POINT_SEC)
+      ps = DEFAULT_POINT_SEC;
+    if (sm < MIN_SAVE_MIN || sm > MAX_SAVE_MIN)
+      sm = DEFAULT_SAVE_MIN;
     pointIntervalMs = ps * 1000UL;
-    saveIntervalMs = sm * 60000UL;
+    saveIntervalMs  = sm * 60000UL;
   }
 
   if (!LittleFS.begin(true)) {
     Serial.println("[FS] LittleFS отформатирован");
   }
-  if (!LittleFS.exists(LOGS_DIR)) LittleFS.mkdir(LOGS_DIR);
+  if (!LittleFS.exists(LOGS_DIR))
+    LittleFS.mkdir(LOGS_DIR);
 
-  // DHT22 / AM2320 (однопроводный режим)
   dht.begin();
 
-  // MH-Z19 (аппаратный UART на тех же пинах)
   mhzSerial.begin(9600, SERIAL_8N1, MHZ_RX, MHZ_TX);
   mhz.begin(mhzSerial);
-  mhz.setFilter(true, false);            // скользящее среднее
+  mhz.setFilter(true, false);
   mhz.setRange(5000);
   mhz.autoCalibration(prefs.getBool("abc", true), 24);
-  mhzRange = mhz.getRange();             // читаем один раз, чтобы не дёргать датчик каждые 5 с
+  mhzRange = mhz.getRange();
   Serial.printf("[MHZ] UART1 rx=%d tx=%d, range=%d, ABC=%d, err=%u\n",
                 MHZ_RX, MHZ_TX, mhzRange,
                 prefs.getBool("abc", true) ? 1 : 0, mhz.errorCode);
-  delay(3000);                           // прогрев
+  delay(3000);
 
   setupNetwork();
   setupWeb();
 
-  // первая точка сразу; далее по настроенным интервалам
   readSensors();
   latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
-  lastLogMs = millis();
-  lastPointMs = millis();
+  lastLogMs        = millis();
+  lastPointMs      = millis();
   Serial.printf("[INIT] точка каждые %lu с, сохранение в файл каждые %lu мин\n",
                 pointIntervalMs / 1000, saveIntervalMs / 60000);
   Serial.println("[INIT] готово");
 }
 
 void loop() {
-  if (dnsStarted) dnsServer.processNextRequest();
+  if (dnsStarted)
+    dnsServer.processNextRequest();
 
-  // чтение датчиков раз в 5 секунд
   static uint32_t lastRead = 0;
   if (millis() - lastRead > 5000) {
     lastRead = millis();
@@ -1032,18 +1016,18 @@ void loop() {
     tryNtp();
   }
 
-  // промежуточная точка в RAM (для графиков)
   if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
-    lastPointMs = millis();
+    lastPointMs      = millis();
     latest.timestamp = (uint32_t)time(nullptr);
-    if (dhtOk || mhzOk) pushLivePoint(latest);
+    if (dhtOk || mhzOk)
+      pushLivePoint(latest);
   }
 
-  // сохранение точки в файл (реже, чтобы не изнашивать flash)
   if (millis() - lastLogMs >= saveIntervalMs) {
-    lastLogMs = millis();
+    lastLogMs        = millis();
     latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
-    if (dhtOk || mhzOk) logReading(latest);
+    if (dhtOk || mhzOk)
+      logReading(latest);
   }
 
   delay(50);

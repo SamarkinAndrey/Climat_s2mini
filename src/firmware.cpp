@@ -82,6 +82,10 @@ bool     dhtOk = false, mhzOk = false;
 bool     mhzHeating      = true;
 bool     mdnsStarted     = false;
 bool     mdnsRestart     = false;
+uint32_t staDownSinceMs  = 0;   // с какого момента нет STA-связи (0 — связь есть)
+uint32_t lastStaRetryMs  = 0;   // время последней попытки переподключения
+uint32_t lastHeartbeatMs = 0;   // время последнего сердцебиения в лог
+uint8_t  lastStaDiscReason = 0; // код последнего отключения STA (Wi-Fi reason)
 uint32_t heatingStartMs  = 0;
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
@@ -1105,11 +1109,30 @@ static void setupNetwork() {
                   DEFAULT_WIFI_SSID);
   }
 
+  WiFi.setAutoReconnect(true);
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
-    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-      Serial.printf("[NET] STA подключено, IP: %s\n",
-                    IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
-      mdnsRestart = true;
+    switch ((int)event) {
+      case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+        Serial.printf("[NET] STA: подключено к \"%s\", канал %u\n",
+                      (const char *)info.wifi_sta_connected.ssid,
+                      (unsigned)info.wifi_sta_connected.channel);
+        break;
+      case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        lastStaDiscReason = info.wifi_sta_disconnected.reason;
+        Serial.printf("[NET] STA: отключено, reason=%u\n", (unsigned)lastStaDiscReason);
+        break;
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        Serial.printf("[NET] STA подключено, IP: %s\n",
+                      IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+        staDownSinceMs = 0;
+        mdnsRestart    = true;
+        break;
+      case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+        Serial.println("[NET] STA: потерян IP");
+        mdnsRestart = true;
+        break;
+      default:
+        break;
     }
   });
 
@@ -1197,10 +1220,82 @@ void setup() {
   Serial.println("[INIT] готово");
 }
 
+// Сеть: автопереподключение STA и периодическое сердцебиение в лог.
+// Сердцебиение нужно, чтобы отличать «loop() завис» от «просто нет событий».
+static void netTick() {
+  uint32_t now = millis();
+
+  if (cfgSsid.length()) {
+    bool conn = (WiFi.status() == WL_CONNECTED);
+
+    if (conn && apMode) {
+      apMode = false;
+      Serial.printf("[NET] STA поднялось, работаю в сети, IP %s\n",
+                    WiFi.localIP().toString().c_str());
+      mdnsRestart = true;
+    }
+
+    if (!conn) {
+      if (!staDownSinceMs) {
+        staDownSinceMs = now;
+        Serial.printf("[NET] нет STA-связи (статус %d, последняя причина %u)\n",
+                      (int)WiFi.status(), (unsigned)lastStaDiscReason);
+      }
+      if (now - lastStaRetryMs >= 10000) {
+        lastStaRetryMs = now;
+        if (now - staDownSinceMs >= 120000) {
+          Serial.println("[NET] простой STA > 2 мин — перезапускаю подключение");
+          WiFi.disconnect(false, false);
+          WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+        } else {
+          Serial.printf("[NET] попытка переподключения STA (статус %d)\n", (int)WiFi.status());
+          WiFi.reconnect();
+        }
+      }
+    } else {
+      staDownSinceMs = 0;
+    }
+  }
+
+  if (now - lastHeartbeatMs >= 30000) {
+    lastHeartbeatMs = now;
+    Serial.printf("[HB] up=%lus wifi=%d ip=%s gw=%s mask=%s dns=%s rssi=%d heap=%u dht=%d mhz=%d heat=%d ap=%d mdns=%d\n",
+                  (unsigned long)(now / 1000), (int)WiFi.status(),
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.subnetMask().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str(),
+                  (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
+                  (unsigned)ESP.getFreeHeap(), (int)dhtOk, (int)mhzOk, (int)mhzHeating,
+                  (int)apMode, (int)mdnsStarted);
+
+    // Проверяем, ходит ли STA-трафик вообще: шлюз обязан отвечать.
+    if (WiFi.status() == WL_CONNECTED) {
+      IPAddress  gw = WiFi.gatewayIP();
+      WiFiClient c;
+      bool       ok = (gw[0] != 0) && c.connect(gw, 80, 1500);
+      c.stop();
+      Serial.printf("[NET] проверка связи: шлюз %s:80 — %s\n", gw.toString().c_str(),
+                    ok ? "OK" : "НЕТ");
+    }
+  }
+}
+
 void loop() {
+  // Отладка: символ 'd' по serial принудительно рвёт STA — проверка переподключения.
+  if (Serial.available()) {
+    if (Serial.read() == 'd') {
+      Serial.println("[NET] отладка: принудительный разрыв STA");
+      WiFi.disconnect(false, false);
+      staDownSinceMs = 0;
+      lastStaRetryMs = 0;
+    }
+  }
+
   if (dnsStarted)
     dnsServer.processNextRequest();
 
+  netTick();
   startMdns();
   static uint32_t lastRead = 0;
   if (millis() - lastRead > 5000) {

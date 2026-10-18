@@ -594,31 +594,74 @@
       saveUi();
     }
 
-    // Свайп влево/вправо переключает вкладки (горизонтальный жест).
+    // Плавный свайп вкладок с небольшой анимацией
     const TAB_ORDER = Array.from(document.querySelectorAll('nav button')).map(b => b.dataset.tab);
-    let swX = 0, swY = 0, swTrack = false;
+    const mainEl = document.querySelector('main');
+    let swX = 0, swY = 0, swStartTab = null, swTrack = false, swDir = 0;
+    let swTranslate = 0, swDragging = false;
+    let swActive = false;
+    mainEl.style.transition = 'none';
+
+    function applySwipeTransform(t) {
+      mainEl.style.transform = 'translateX(' + t.toFixed(2) + 'px)';
+    }
+    function endSwipeAnim() {
+      mainEl.style.transition = 'transform 140ms ease-out';
+      applySwipeTransform(0);
+      setTimeout(() => { mainEl.style.transition = 'none'; }, 150);
+    }
     document.addEventListener('touchstart', e => {
       if (e.touches.length !== 1) { swTrack = false; return; }
-      swX = e.touches[0].clientX; swY = e.touches[0].clientY; swTrack = true;
+      swX = e.touches[0].clientX; swY = e.touches[0].clientY;
+      swStartTab = currentTab;
+      swTrack = true; swDir = 0; swTranslate = 0; swDragging = false; swActive = false;
+      mainEl.style.transition = 'none';
     }, { passive: true });
     document.addEventListener('touchmove', e => {
       if (!swTrack) return;
-      // блокируем прокрутку основного контента только если намеренно горизонтальный свайп
       const dx = e.touches[0].clientX - swX;
       const dy = e.touches[0].clientY - swY;
       if (Math.abs(dx) > Math.abs(dy) * 1.2) {
+        swDragging = true;
         e.preventDefault();
+        // не выходить за пределы доступных табов
+        const i = TAB_ORDER.indexOf(swStartTab) + (dx < 0 ? 1 : -1);
+        if (i < 0 || i >= TAB_ORDER.length) {
+          swTranslate = dx * 0.25;
+        } else {
+          swTranslate = dx;
+        }
+        swDir = dx < 0 ? 1 : -1;
+        swActive = true;
+        applySwipeTransform(swTranslate);
       }
     }, { passive: false });
     document.addEventListener('touchend', e => {
-      if (!swTrack) return;
-      swTrack = false;
+      if (!swTrack || !swDragging) {
+        // "защита" от случайного засчёта
+        if (swTrack && !swDragging) { swTrack = false; applySwipeTransform(0); }
+        return;
+      }
+      swTrack = false; swDragging = false;
       const dx = e.changedTouches[0].clientX - swX;
       const dy = e.changedTouches[0].clientY - swY;
-      if (Math.abs(dx) < 55 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
-      const i = TAB_ORDER.indexOf(currentTab) + (dx < 0 ? 1 : -1);
-      if (i >= 0 && i < TAB_ORDER.length) showTab(TAB_ORDER[i]);
+      if (Math.abs(dx) >= 70 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+        const i = TAB_ORDER.indexOf(swStartTab) + (dx < 0 ? 1 : -1);
+        if (i >= 0 && i < TAB_ORDER.length) {
+          // сразу анимируем уход — после смены таба уберём трансформ
+          mainEl.style.transition = 'transform 150ms ease-out';
+          applySwipeTransform(dx > 0 ? Math.min(dx, 180) : Math.max(dx, -180));
+          setTimeout(() => {
+            showTab(TAB_ORDER[i]);
+            applySwipeTransform(0);
+            mainEl.style.transition = 'none';
+          }, 150);
+          return;
+        }
+      }
+      endSwipeAnim();
     }, { passive: true });
+
 
     const MET = {
       t: { cv: 'ch-t', box: 'c-t', ar: 'ar-t', color: '#f59e0b', label: '°C', field: 't' },

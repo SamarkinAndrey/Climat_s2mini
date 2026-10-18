@@ -10,6 +10,8 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <algorithm>
+#include <freertos/semphr.h>
+#include <string.h>
 #include <vector>
 
 #define DHT_PIN       5
@@ -56,6 +58,30 @@ AsyncWebServer server(80);
 DNSServer      dnsServer;
 bool           dnsStarted = false;
 
+// MH-Z19 общается по одному UART, а дёргают его две задачи: loop (getCO2) и
+// обработчики веб-сервера (getRange/getABC/calibrate). Библиотека не
+// потокобезопасна — все обращения к датчику идём через мьютекс.
+// LittleFS перечисляют/читают обработчики и одновременно пишет loop (точка,
+// ротация). Внутри драйвера есть свой мьютекс, но составные операции
+// («перечислить и удалить») держим целыми, чтобы не перемешивались с ротацией.
+static SemaphoreHandle_t mhzMutex = nullptr;
+static SemaphoreHandle_t fsMutex  = nullptr;
+
+static bool mhzLock(uint32_t ms = 1000) {
+  return mhzMutex && xSemaphoreTake(mhzMutex, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+static void mhzUnlock() {
+  if (mhzMutex)
+    xSemaphoreGive(mhzMutex);
+}
+static bool fsLock(uint32_t ms = 2000) {
+  return fsMutex && xSemaphoreTake(fsMutex, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+static void fsUnlock() {
+  if (fsMutex)
+    xSemaphoreGive(fsMutex);
+}
+
 struct Reading {
   uint32_t timestamp   = 0;
   float    temperature = 0;
@@ -93,6 +119,10 @@ struct Point {
 Point liveBuf[MAX_LIVE_POINTS];
 int   liveHead  = 0;
 int   liveCount = 0;
+// Кольцо ОЗУ читают и loop-задача, и обработчики веб-сервера (другая задача).
+// Точку пишем и читаем целиком под короткой критической секцией — иначе
+// возможна «рваная» точка (новый ts со старыми значениями).
+static portMUX_TYPE liveMux = portMUX_INITIALIZER_UNLOCKED;
 
 String cfgSsid, cfgPass;
 int    mhzRange = 5000;
@@ -190,6 +220,29 @@ static uint32_t firstFileTs(const String &path) {
   return (uint32_t)strtoul(line.substring(0, comma).c_str(), nullptr, 10);
 }
 
+// Пересчёт числа записей по всем лог-файлам и времени самой ранней записи —
+// только на старте (одно чтение файлов), дальше счётчик ведётся инкрементально.
+static void recountLogRows() {
+  std::vector<String> names;
+  listFiles(LOGS_DIR, names);
+  uint32_t total = 0;
+  for (const String &n : names)
+    total += countFileRows(n);
+  logRowsTotal = total;
+
+  oldestSavedTs = 0;
+  if (!names.empty()) {
+    int oi = 0;
+    for (size_t i = 1; i < names.size(); i++)
+      if (names[i] < names[oi])
+        oi = i;                          // файлы названы по дате, свежие — в конце
+    oldestSavedTs = firstFileTs(names[oi]);
+  }
+  Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
+                (unsigned)names.size(), (unsigned long)total,
+                (unsigned long)oldestSavedTs);
+}
+
 static void rotateLogsIfNeeded() {
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
@@ -209,22 +262,39 @@ static void rotateLogsIfNeeded() {
     logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
+    removed++;   // без этого условия removed < 2 не работало
+    // самая ранняя запись теперь в самом старом из оставшихся файлов
+    oldestSavedTs = 0;
+    if (!names.empty()) {
+      int oi = 0;
+      for (size_t i = 1; i < names.size(); i++)
+        if (names[i] < names[oi])
+          oi = i;
+      oldestSavedTs = firstFileTs(names[oi]);
+    }
   }
 }
 
 static void logReading(const Reading &r) {
-  if (!LittleFS.exists(LOGS_DIR))
-    LittleFS.mkdir(LOGS_DIR);
   if (!timeSynced || (time(nullptr) < 1000000)) {
     Serial.println("[LOG] время не синхронизировано (NTP), пропускаю запись в файл");
     return;
   }
+  // ФС может быть занята веб-запросом (история/экспорт) — ждать не будем:
+  // одну точку можно и пропустить, лишь бы loop не встал.
+  if (!fsLock()) {
+    Serial.println("[LOG] ФС занята, запись пропущена");
+    return;
+  }
+  if (!LittleFS.exists(LOGS_DIR))
+    LittleFS.mkdir(LOGS_DIR);
   String path  = todayFile();
   bool   isNew = !LittleFS.exists(path);
 
   File f = LittleFS.open(path, "a");
   if (!f) {
     Serial.println("[LOG] ошибка открытия файла");
+    fsUnlock();
     return;
   }
   if (isNew)
@@ -237,9 +307,11 @@ static void logReading(const Reading &r) {
   Serial.printf("[LOG] записано в %s: %.1fC %.1f%% %uppm\n",
                 path.c_str(), r.temperature, r.humidity, r.co2);
   rotateLogsIfNeeded();
+  fsUnlock();
 }
 
 static void pushLivePoint(const Reading &r) {
+  portENTER_CRITICAL(&liveMux);
   Point &p = liveBuf[liveHead];
   p.ts     = r.timestamp;
   p.t      = r.temperature;
@@ -248,7 +320,24 @@ static void pushLivePoint(const Reading &r) {
   liveHead = (liveHead + 1) % MAX_LIVE_POINTS;
   if (liveCount < MAX_LIVE_POINTS)
     liveCount++;
+  portEXIT_CRITICAL(&liveMux);
   pointsSeq++;
+}
+
+// Снимок головы/счётчика кольца и атомарное чтение точки по индексу.
+static void liveSnapshot(int &head, int &count) {
+  portENTER_CRITICAL(&liveMux);
+  head  = liveHead;
+  count = liveCount;
+  portEXIT_CRITICAL(&liveMux);
+}
+
+static Point liveGet(int idx) {
+  Point p;
+  portENTER_CRITICAL(&liveMux);
+  p = liveBuf[idx];
+  portEXIT_CRITICAL(&liveMux);
+  return p;
 }
 
 static void readSensors() {
@@ -286,8 +375,15 @@ static void readSensors() {
     return;
   }
 
-  int  co2   = mhz.getCO2(false, true);
-  byte err   = mhz.errorCode;
+  // Датчик занят веб-запросом (калибровка/чтение настроек) — пропускаем такт,
+  // чтобы не смешивать обмен по UART из двух задач.
+  if (!mhzLock()) {
+    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+    return;
+  }
+  int  co2 = mhz.getCO2(false, true);
+  byte err = mhz.errorCode;
+  mhzUnlock();
   bool co2ok = (co2 > 0 && co2 <= mhzRange);
 
   static int  co2Fail = 0;
@@ -393,12 +489,15 @@ static String jsonCurrent() {
                             : 0;
   doc["pointSec"]     = pointIntervalMs / 1000;
   doc["saveMin"]      = saveIntervalMs / 60000;
-  doc["points"]       = liveCount;
-  doc["logRows"]      = logRowsTotal;   // всего записей в файлах
+  int lvHead, lvCount;
+  liveSnapshot(lvHead, lvCount);
+  doc["points"] = lvCount;
+
+  doc["logRows"] = logRowsTotal;   // всего записей в файлах
   // Самая ранняя из сохранённых точек: файлы (если есть) либо начало ОЗУ.
   uint32_t firstTs = oldestSavedTs;
-  if (liveCount) {
-    uint32_t ramFirst = liveBuf[(liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS].ts;
+  if (lvCount) {
+    uint32_t ramFirst = liveGet((lvHead - lvCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS).ts;
     if (ramFirst && (!firstTs || ramFirst < firstTs))
       firstTs = ramFirst;
   }
@@ -430,24 +529,36 @@ static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &o
 
   std::vector<HPoint> ring(maxRows);
   int                 cnt = 0, head = 0;
+  // Разбор строки без String/substring — на больших файлах это сотни
+  // временных аллокаций за вызов и заметная фрагментация кучи.
+  char line[128];
   while (f.available()) {
-    String line = f.readStringUntil('\n');
-    int    p1   = line.indexOf(',');
-    if (p1 <= 0 || line.startsWith("timestamp"))
+    size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+    if (n == 0)
+      break;
+    line[n] = 0;
+    if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
       continue;
-    int p2 = line.indexOf(',', p1 + 1);
-    int p3 = line.indexOf(',', p2 + 1);
-    int p4 = line.indexOf(',', p3 + 1);
-    if (p2 < 0 || p3 < 0 || p4 < 0)
+    char *c1 = strchr(line, ',');       // после ts
+    if (!c1)
       continue;
-    uint32_t ts = (uint32_t)line.substring(0, p1).toInt();
+    char *c2 = strchr(c1 + 1, ',');     // после datetime
+    if (!c2)
+      continue;
+    char *c3 = strchr(c2 + 1, ',');
+    if (!c3)
+      continue;
+    char *c4 = strchr(c3 + 1, ',');
+    if (!c4)
+      continue;
+    uint32_t ts = (uint32_t)strtoul(line, nullptr, 10);
     if (ts == 0)
       continue;
     HPoint &p = ring[head];
     p.ts      = ts;
-    p.t       = line.substring(p2 + 1, p3).toFloat();
-    p.h       = line.substring(p3 + 1, p4).toFloat();
-    p.co2     = (uint16_t)line.substring(p4 + 1).toInt();
+    p.t       = atof(c2 + 1);
+    p.h       = atof(c3 + 1);
+    p.co2     = (uint16_t)atoi(c4 + 1);
     head      = (head + 1) % maxRows;
     if (cnt < maxRows)
       cnt++;
@@ -479,24 +590,24 @@ static void printPoint(Print &out, const HPoint &p, bool &first) {
 
 // Догрузка только новых точек (для живого обновления графиков).
 // Отвечает из ОЗУ, файлы не читает — ответ крошечный.
-static String jsonHistorySince(uint32_t since) {
-  String out   = "[";
-  bool   first = true;
-  int    start = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-  for (int i = 0; i < liveCount; i++) {
-    const Point &sp = liveBuf[(start + i) % MAX_LIVE_POINTS];
+// Догрузка только новых точек (живое обновление графиков).
+// Ответ отдаём потоком: раньше всё собиралось в одну String, и при since=0
+// (мусорный/старый параметр) это было до ~90 КБ — OOM и перезагрузка.
+static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
+  AsyncResponseStream *resp = req->beginResponseStream("application/json");
+  resp->print('[');
+  bool first = true;
+  int  lh, lc;
+  liveSnapshot(lh, lc);
+  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  for (int i = 0; i < lc; i++) {
+    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
     if (sp.ts <= since)
       continue;
-    HPoint p{sp.ts, sp.t, sp.h, sp.co2};
-    if (!first)
-      out += ',';
-    first = false;
-    char buf[160];
-    fmtPoint(buf, sizeof(buf), p);
-    out += buf;
+    printPoint(*resp, HPoint{sp.ts, sp.t, sp.h, sp.co2}, first);
   }
-  out += "]";
-  return out;
+  resp->print(']');
+  req->send(resp);
 }
 
 // since=0 — без ограничения по времени; lastN>0 — «последние N точек» (для таблицы).
@@ -504,38 +615,46 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
   int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
 
   // --- точки из ОЗУ (высокое разрешение) ---
-  std::vector<HPoint> live;
-  live.reserve(liveCount);
-  int first = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-  for (int i = 0; i < liveCount; i++) {
-    const Point &sp = liveBuf[(first + i) % MAX_LIVE_POINTS];
-    if (sp.ts == 0 || (since && sp.ts < since))
-      continue;
-    live.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
+  // Копию кольца в отдельный вектор (до 23 КБ) не делаем: читаем точки прямо
+  // по индексам. ts монотонны, поэтому прошедшие фильтр точки — непрерывный
+  // «хвост» кольца.
+  int lh, lc;
+  liveSnapshot(lh, lc);
+  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+
+  int      firstPass  = 0;             // смещение первой точки, прошедшей фильтр
+  uint32_t oldestLive = 0xFFFFFFFFu;
+  while (firstPass < lc) {
+    uint32_t ts = liveGet((start + firstPass) % MAX_LIVE_POINTS).ts;
+    if (ts != 0 && !(since && ts < since)) {
+      oldestLive = ts;
+      break;
+    }
+    firstPass++;
   }
-  uint32_t oldestLive = live.empty() ? 0xFFFFFFFFu : live.front().ts;
+  int liveAfter = lc - firstPass;
 
   // --- сколько строк нужно добрать из файлов ---
   int need;
   if (lastN > 0) {
-    need = lastN - (int)live.size();
+    need = lastN - liveAfter;
   } else if (since && oldestLive != 0xFFFFFFFFu) {
     uint32_t saveSec = saveIntervalMs / 1000UL;
     if (saveSec < 60)
       saveSec = 60;
     uint32_t sec = (oldestLive > since) ? (oldestLive - since) : 0;
     need         = (int)(sec / saveSec) + 2;
-    if (need > MAX_FILE_ROWS)
-      need = MAX_FILE_ROWS;
   } else {
     need = MAX_FILE_ROWS;
   }
   if (need < 0)
     need = 0;
+  if (need > MAX_FILE_ROWS)
+    need = MAX_FILE_ROWS;   // страховка: сколько бы точек ни просили, не больше лимита
 
   // --- точки из файлов (только хвосты, файл целиком не читаем) ---
   std::vector<HPoint> rows;
-  if (need > 0) {
+  if (need > 0 && fsLock()) {
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (size_t i = 0; i < names.size(); i++)
@@ -543,10 +662,8 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
         if (names[j] < names[i])
           std::swap(names[i], names[j]);
 
-    std::vector<std::vector<HPoint>> chunks;
-    int                             totalRows = 0;
-    for (int fi = (int)names.size() - 1; fi >= 0 && totalRows < need; fi--) {
-      int perFile = need - totalRows;
+    for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < need; fi--) {
+      int perFile = need - (int)rows.size();
       if (perFile > 600)
         perFile = 600;   // кольцо на файл ограничиваем, чтобы не раздувать heap
       std::vector<HPoint> tail;
@@ -556,23 +673,25 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
       // файл целиком старше периода — остальные ещё старее, дальше нет смысла
       if (since && tail.back().ts < since)
         break;
-      totalRows += (int)tail.size();
-      chunks.push_back(std::move(tail));
-    }
-    for (int i = (int)chunks.size() - 1; i >= 0; i--)
-      for (const HPoint &p : chunks[i]) {
+      std::vector<HPoint> keep;
+      keep.reserve(tail.size());
+      for (const HPoint &p : tail) {
         if (p.ts == 0 || p.ts >= oldestLive)
           continue;
         if (since && p.ts < since)
           continue;
-        rows.push_back(p);
+        keep.push_back(p);
       }
+      // файл читаем от новых к старым, поэтому вставляем в начало rows
+      rows.insert(rows.begin(), keep.begin(), keep.end());
+    }
+    fsUnlock();
   }
 
   // Бюджет точек: редкую историю из файлов бережём, прореживаем только
   // плотную свежую часть из ОЗУ (иначе 12 точек старой части «съедаются»
   // так же, как 360 свежих).
-  int liveKeep = (int)live.size();
+  int liveKeep = liveAfter;
   int minLive  = maxOut / 3;
   int room     = maxOut - (int)rows.size();
   if (room < minLive)
@@ -595,13 +714,15 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
         outv.push_back(rows[i]);
     }
   }
-  if (!live.empty()) {
-    int step = ((int)live.size() + liveKeep - 1) / liveKeep;
+  if (liveAfter > 0) {
+    int step = (liveAfter + liveKeep - 1) / liveKeep;
     if (step < 1)
       step = 1;
-    int off = ((int)live.size() - 1) % step;
-    for (int i = off; i < (int)live.size(); i += step)
-      outv.push_back(live[i]);
+    int off = (liveAfter - 1) % step;
+    for (int k = off; k < liveAfter; k += step) {
+      Point sp = liveGet((start + firstPass + k) % MAX_LIVE_POINTS);
+      outv.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
+    }
   }
 
   // ответ отдаём потоком: JSON целиком в памяти не собираем
@@ -878,8 +999,33 @@ const MET={
 };
 let openCharts={t:false,h:false,co2:false};  
 
-function drawOne(k){const m=MET[k];if(!m)return;drawChart(m.cv,m.color,m.label,hist,m.field);}
-function drawAll(){for(const k in MET)if(openCharts[k])drawOne(k);}
+// Отрисовка рассчитана на обновление раз в 5 секунд, поэтому:
+//  • ширину канвасов читаем одним заходом (это чтение layout), затем только
+//    рисуем — иначе каждая следующая диаграмма вызывает принудительный reflow;
+//  • если данные и размер не менялись, перерисовки нет вообще.
+function chartJobs(){
+ const jobs=[];
+ for(const k in MET){
+  if(!openCharts[k])continue;
+  const m=MET[k], cv=$(m.cv); if(!cv)continue;
+  jobs.push({cv,w:Math.max(160,cv.clientWidth||600),m});
+ }
+ return jobs;
+}
+function drawKey(){return currentTab+'|'+window.innerWidth+'|'+hist.length+'|'+(hist.length?hist[hist.length-1].ts:'')+'|'+Object.keys(MET).filter(k=>openCharts[k]).join(',');}
+let lastDrawKey='';
+function drawAll(){
+ if(currentTab!=='live')return;           // графики видны только на этой вкладке
+ const key=drawKey();
+ if(key===lastDrawKey)return;
+ lastDrawKey=key;
+ for(const j of chartJobs())drawChart(j.cv,j.m.color,j.m.label,hist,j.m.field,j.w);
+}
+function drawOne(k){
+ const m=MET[k]; if(!m)return;
+ const cv=$(m.cv); if(!cv)return;
+ drawChart(cv,m.color,m.label,hist,m.field,Math.max(160,cv.clientWidth||600));
+}
 
 function toggleChart(k){
  openCharts[k]=!openCharts[k];
@@ -889,18 +1035,23 @@ function toggleChart(k){
  saveUi();
 }
 
-function drawChart(id,color,label,data,yfield){
- const cv=$(id); if(!cv)return;
-
+function drawChart(cv,color,label,data,yfield,w){
+ if(!cv)return;
  const h=window.innerWidth<760?190:280;
- cv.style.height=h+'px';
  const dpr=window.devicePixelRatio||1;
- const w=Math.max(160,cv.clientWidth||600);
- cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr);
+ // Буфер канваса пересоздаём только при реальном изменении размера: эта
+ // операция заново выделяет память под весь растр (на телефоне — мегабайты).
+ const W=Math.round(w*dpr), H=Math.round(h*dpr);
+ if(cv.width!==W||cv.height!==H){cv.width=W; cv.height=H;}
+ if(cv.style.height!==h+'px')cv.style.height=h+'px';
  const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
  const pad={l:44,r:10,t:16,b:24};
- const vals=data.map(d=>Number(d[yfield])||0);
- let min=Math.min(...vals), max=Math.max(...vals);
+ // min/max одним проходом: без map() и Math.min(...arr) — это лишние массивы
+ let min=Infinity, max=-Infinity;
+ for(let i=0;i<data.length;i++){
+  let v=Number(data[i][yfield]); if(!isFinite(v))v=0;
+  if(v<min)min=v; if(v>max)max=v;
+ }
  if(!isFinite(min)||!isFinite(max)){min=0;max=1;}
  if(min===max){min-=1;max+=1;}
  const pw=w-pad.l-pad.r, ph=h-pad.t-pad.b;
@@ -1032,8 +1183,14 @@ async function loadStatus(){
 
 async function clearLogs(){
  if(!confirm('Удалить все файлы логов?'))return;
- const r=await fetch('/api/logs/clear',{method:'POST'});
- alert(await r.text());loadData();}
+ let msg='';
+ for(let i=0;i<40;i++){
+   const r=await fetch('/api/logs/clear',{method:'POST'});
+   msg=await r.text();
+   if(msg==='Логи удалены')break;                 // сервер стирает порциями
+   await new Promise(res=>setTimeout(res,300));   // даём питанию/флешу передохнуть
+ }
+ alert(msg);loadData();}
 
 async function loadSettings(){
  try{const s=await api('/api/settings');
@@ -1099,14 +1256,16 @@ static void setupWeb() {
     // ?since=<ts> — только новые точки (живое обновление графиков, ответ крошечный)
     if (req->hasParam("since")) {
       uint32_t since = (uint32_t)strtoul(req->getParam("since")->value().c_str(), nullptr, 10);
-      req->send(200, "application/json", jsonHistorySince(since));
+      sendHistorySince(req, since);
       return;
     }
 
     // ?points=N — N последних точек (таблица «Последние записи»)
     if (req->hasParam("points")) {
       int pts = (int)req->getParam("points")->value().toInt();
-      pts     = constrain(pts, 10, 20000);
+      // Верхнюю границу держим по числу читаемых строк: иначе outv.reserve()
+      // на десятки тысяч точек выделяет сотни КБ и валит устройство в OOM.
+      pts = constrain(pts, 10, MAX_FILE_ROWS);
       sendHistory(req, 0, pts);
       return;
     }
@@ -1157,11 +1316,19 @@ static void setupWeb() {
   });
 
   server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "application/json", listLogFiles());
+    String out = "[]";
+    if (fsLock(500)) {
+      out = listLogFiles();
+      fsUnlock();
+    }
+    req->send(200, "application/json", out);
   });
 
   server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req) {
-    String              all = "timestamp,datetime,temperature,humidity,co2\n";
+    // Отдаём CSV потоком: раньше вся история собиралась в одну String
+    // (до сотен КБ) — это гарантированный OOM при скачивании логов.
+    AsyncResponseStream *resp = req->beginResponseStream("text/csv");
+    resp->print("timestamp,datetime,temperature,humidity,co2\n");
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (size_t i = 0; i < names.size(); i++)
@@ -1174,12 +1341,14 @@ static void setupWeb() {
         continue;
       while (f.available()) {
         String line = f.readStringUntil('\n');
-        if (!line.startsWith("timestamp"))
-          all += line + "\n";
+        if (line.length() && !line.startsWith("timestamp")) {
+          resp->print(line);
+          resp->print('\n');
+        }
       }
       f.close();
     }
-    req->send(200, "text/csv", all);
+    req->send(resp);
   });
 
   server.on("/api/wifi/save", HTTP_POST, [](AsyncWebServerRequest *req) {
@@ -1214,31 +1383,43 @@ static void setupWeb() {
       type = req->getParam("type")->value();
 
     String resp;
-    if (type == "zero") {
-      mhz.calibrate();
-      resp = "Команда Cal Zero (400 ppm) отправлена. Не трогайте датчик ~1 минуты.";
-    } else if (type == "span") {
-      mhz.zeroSpan(2000);
-      resp = "Команда Cal Span (2000 ppm) отправлена.";
-    } else if (type == "abc_on") {
-      mhz.autoCalibration(true, 24);
-      prefs.putBool("abc", true);
-      resp = "Автоматическая базовая калибровка (ABC, раз в 24 ч) включена.";
-    } else if (type == "abc_off") {
-      mhz.autoCalibration(false);
-      prefs.putBool("abc", false);
-      resp = "Автоматическая базовая калибровка (ABC) выключена.";
+    if (!mhzLock(2000)) {
+      resp = "Датчик занят, повторите запрос";
     } else {
-      resp = "Неизвестная команда";
+      if (type == "zero") {
+        mhz.calibrate();
+        resp = "Команда Cal Zero (400 ppm) отправлена. Не трогайте датчик ~1 минуты.";
+      } else if (type == "span") {
+        mhz.zeroSpan(2000);
+        resp = "Команда Cal Span (2000 ppm) отправлена.";
+      } else if (type == "abc_on") {
+        mhz.autoCalibration(true, 24);
+        prefs.putBool("abc", true);
+        resp = "Автоматическая базовая калибровка (ABC, раз в 24 ч) включена.";
+      } else if (type == "abc_off") {
+        mhz.autoCalibration(false);
+        prefs.putBool("abc", false);
+        resp = "Автоматическая базовая калибровка (ABC) выключена.";
+      } else {
+        resp = "Неизвестная команда";
+      }
+      mhzUnlock();
     }
     Serial.println("[CAL] " + resp);
     req->send(200, "text/plain", resp);
   });
 
   server.on("/api/sensor", HTTP_GET, [](AsyncWebServerRequest *req) {
+    int  range = mhzRange;                       // если датчик занят — кэш с запуска
+    bool abc   = prefs.getBool("abc", true);
+    if (mhzLock()) {
+      range = mhz.getRange();
+      abc   = mhz.getABC();
+      mhzUnlock();
+    }
     JsonDocument doc;
-    doc["range"] = mhz.getRange();
-    doc["abc"]   = mhz.getABC();
+    doc["range"] = range;
+    doc["abc"]   = abc;
     doc["co2"]   = latest.co2;
     doc["mhzOk"] = mhzOk;
     doc["heating"] = mhzHeating;
@@ -1248,12 +1429,37 @@ static void setupWeb() {
   });
 
   server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *req) {
+    // Файлы удаляем порциями: стирание flash даёт пик тока, и удаление всех
+    // 20 файлов подряд может уронить питание (brownout). Клиент повторяет
+    // запрос, пока файлы не кончатся.
+    if (!fsLock()) {
+      req->send(503, "text/plain", "Файловая система занята, повторите");
+      return;
+    }
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
-    for (auto &n : names)
+    for (size_t i = 0; i < names.size(); i++)
+      for (size_t j = i + 1; j < names.size(); j++)
+        if (names[j] < names[i])
+          std::swap(names[i], names[j]);
+    const int perPass = 2;                 // сколько файлов стираем за один запрос
+    int       removed = 0;
+    for (auto &n : names) {
+      if (removed >= perPass)
+        break;
+      uint32_t gone = countFileRows(n);
+      logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
       LittleFS.remove(n);
-    logRowsTotal = 0;
-    oldestSavedTs = 0;
+      removed++;
+    }
+    int left      = (int)names.size() - removed;
+    oldestSavedTs = (left > 0) ? firstFileTs(names[removed]) : 0;
+    fsUnlock();
+    if (left > 0) {
+      req->send(200, "text/plain",
+                "Удалено " + String(removed) + ", осталось " + String(left));
+      return;
+    }
     req->send(200, "text/plain", "Логи удалены");
   });
 
@@ -1354,6 +1560,9 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== Climat Monitor ===");
+
+  mhzMutex = xSemaphoreCreateMutex();
+  fsMutex  = xSemaphoreCreateMutex();
 
   prefs.begin("cfg", false);
 

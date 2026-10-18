@@ -1268,30 +1268,10 @@ static void netTick() {
                   (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
                   (unsigned)ESP.getFreeHeap(), (int)dhtOk, (int)mhzOk, (int)mhzHeating,
                   (int)apMode, (int)mdnsStarted);
-
-    // Проверяем, ходит ли STA-трафик вообще: шлюз обязан отвечать.
-    if (WiFi.status() == WL_CONNECTED) {
-      IPAddress  gw = WiFi.gatewayIP();
-      WiFiClient c;
-      bool       ok = (gw[0] != 0) && c.connect(gw, 80, 1500);
-      c.stop();
-      Serial.printf("[NET] проверка связи: шлюз %s:80 — %s\n", gw.toString().c_str(),
-                    ok ? "OK" : "НЕТ");
-    }
   }
 }
 
 void loop() {
-  // Отладка: символ 'd' по serial принудительно рвёт STA — проверка переподключения.
-  if (Serial.available()) {
-    if (Serial.read() == 'd') {
-      Serial.println("[NET] отладка: принудительный разрыв STA");
-      WiFi.disconnect(false, false);
-      staDownSinceMs = 0;
-      lastStaRetryMs = 0;
-    }
-  }
-
   if (dnsStarted)
     dnsServer.processNextRequest();
 

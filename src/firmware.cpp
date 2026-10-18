@@ -1124,6 +1124,7 @@ let chartsTimer=null;
 async function loadCharts(full){
  try{
   const hours=$('rangeSel').value;
+  const hrs=parseFloat(hours)||0;
   if(full||!hist.length||histRange!==hours){
    // полная загрузка: при открытии, смене периода и раз в 2 минуты
    histRange=hours;
@@ -1133,16 +1134,17 @@ async function loadCharts(full){
    const since=hist.length?hist[hist.length-1].ts:0;
    const add=await api('/api/history?since='+since);
    if(add&&add.length)hist=hist.concat(add);
-   // окно периода держим всегда, даже если новых точек не пришло
-   const hrs=parseFloat(hours)||0;
-   const last=hist.length?Number(hist[hist.length-1].ts)||0:0;
-   if(hrs>0&&last>0){
-    const cut=last-hrs*3600;
-    hist=hist.filter(d=>Number(d.ts)>=cut);
-   }
-   const cap=hrs>0?600:1500;
-   if(hist.length>cap)hist=hist.slice(hist.length-cap);
   }
+  // Окно периода держим ВСЕГДА — в том числе на первой загрузке. После
+  // прошивки RTC сброшен и NTP может ещё не пройти: сервер не вычислит since
+  // и вернёт всю историю. Обрезаем на клиенте, иначе первый кадр — «за всё время».
+  const last=hist.length?Number(hist[hist.length-1].ts)||0:0;
+  if(hrs>0&&last>0){
+   const cut=last-hrs*3600;
+   hist=hist.filter(d=>Number(d.ts)>=cut);
+  }
+  const cap=hrs>0?600:1500;
+  if(hist.length>cap)hist=hist.slice(hist.length-cap);
   drawAll();
   updateLogBadge();
  }catch(e){}}

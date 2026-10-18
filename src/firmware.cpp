@@ -11,6 +11,7 @@
 #include <WiFi.h>
 #include <algorithm>
 #include <freertos/semphr.h>
+#include <memory>
 #include <string.h>
 #include <vector>
 
@@ -281,8 +282,10 @@ static void logReading(const Reading &r) {
     return;
   }
   // ФС может быть занята веб-запросом (история/экспорт) — ждать не будем:
-  // одну точку можно и пропустить, лишь бы loop не встал.
-  if (!fsLock()) {
+  // одну точку можно и пропустить, лишь бы loop не встал. 300 мс, а не 2 с:
+  // запись точки случается раз в минуту, терять её из-за долгого ожидания
+  // на мьютексе смысла нет.
+  if (!fsLock(300)) {
     Serial.println("[LOG] ФС занята, запись пропущена");
     return;
   }
@@ -340,14 +343,40 @@ static Point liveGet(int idx) {
   return p;
 }
 
+// Текущие показания (latest) пишет loop-задача, читает обработчик /api/current
+// в другой задаче. Все обращения — под короткой критической секцией, иначе
+// возможна «рваная» тройка t/h/co2 из разных измерений.
+static portMUX_TYPE latestMux = portMUX_INITIALIZER_UNLOCKED;
+static void setLatestTh(float t, float h) {
+  portENTER_CRITICAL(&latestMux);
+  latest.temperature = t;
+  latest.humidity    = h;
+  portEXIT_CRITICAL(&latestMux);
+}
+static void setLatestCo2(uint16_t c) {
+  portENTER_CRITICAL(&latestMux);
+  latest.co2 = c;
+  portEXIT_CRITICAL(&latestMux);
+}
+static void setLatestTs(uint32_t ts) {
+  portENTER_CRITICAL(&latestMux);
+  latest.timestamp = ts;
+  portEXIT_CRITICAL(&latestMux);
+}
+static Reading getLatest() {
+  Reading r;
+  portENTER_CRITICAL(&latestMux);
+  r = latest;
+  portEXIT_CRITICAL(&latestMux);
+  return r;
+}
+
 static void readSensors() {
   float t  = dht.readTemperature();
   float h  = dht.readHumidity();
   bool  ok = !isnan(t) && !isnan(h);
-  if (ok) {
-    latest.temperature = t;
-    latest.humidity    = h;
-  }
+  if (ok)
+    setLatestTh(t, h);
 
   static int lastOk = -1;
   if ((int)ok != lastOk) {
@@ -371,14 +400,27 @@ static void readSensors() {
       Serial.printf("[MHZ] прогрев: %lu/%lu с — показания не пишутся\n",
                     uptime / 1000UL, MHZ19_HEATING_TIME / 1000UL);
     }
-    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+    setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
     return;
   }
+
+  static int      co2Fail   = 0;
+  static byte     lastErr   = 0xFF;
+  static uint32_t lastMhzMs = 0;
+
+  // Датчик давно не отвечает — опрашиваем раз в 30 с вместо 5 с. Неудачное
+  // чтение блокирует до ~1 с (две транзакции по TIMEOUT_PERIOD=500 мс) и всё
+  // это время держит mhzMutex, из-за чего простаивают loop и веб-запросы.
+  if (co2Fail >= 3 && millis() - lastMhzMs < 30000) {
+    setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
+    return;
+  }
+  lastMhzMs = millis();
 
   // Датчик занят веб-запросом (калибровка/чтение настроек) — пропускаем такт,
   // чтобы не смешивать обмен по UART из двух задач.
   if (!mhzLock()) {
-    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+    setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
     return;
   }
   int  co2 = mhz.getCO2(false, true);
@@ -386,12 +428,10 @@ static void readSensors() {
   mhzUnlock();
   bool co2ok = (co2 > 0 && co2 <= mhzRange);
 
-  static int  co2Fail = 0;
-  static byte lastErr = 0xFF;
   if (co2ok) {
-    co2Fail    = 0;
-    latest.co2 = co2;
-    mhzOk      = true;
+    co2Fail = 0;
+    setLatestCo2(co2);
+    mhzOk = true;
   } else if (err == RESULT_FILTER) {
     co2Fail = 0;
   } else {
@@ -410,7 +450,7 @@ static void readSensors() {
       Serial.printf("[MHZ] ошибка чтения, код %u (1=OK 2=timeout 3=match 4=crc 5=filter), сбоев подряд: %d\n",
                     err, co2Fail);
   }
-  latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+  setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
 }
 
 static void tryNtp() {
@@ -437,7 +477,7 @@ static void tryNtp() {
     Serial.printf("[NTP] Синхронизирован: %04d-%02d-%02d %02d:%02d:%02d (MSK)\n",
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
-    latest.timestamp = (uint32_t)tt;
+    setLatestTs((uint32_t)tt);
     if (!mhzHeating) {            // во время прогрева точки не создаём
       logReading(latest);
       pushLivePoint(latest);
@@ -458,22 +498,25 @@ static uint64_t uptimeMsTotal() {
   return total;
 }
 
-static String jsonCurrent() {
+// Сериализуем в готовый буфер (без промежуточной String на куче — этот
+// обработчик самый горячий, его опрашивает каждый клиент раз в 5 с).
+static size_t jsonCurrent(char *buf, size_t n) {
   JsonDocument doc;
-  doc["temperature"] = latest.temperature;
-  doc["humidity"]    = latest.humidity;
-  doc["co2"]         = latest.co2;
+  Reading r = getLatest();          // атомарный снимок показаний
+  doc["temperature"] = r.temperature;
+  doc["humidity"]    = r.humidity;
+  doc["co2"]         = r.co2;
   doc["dhtOk"]       = dhtOk;
   doc["mhzOk"]       = mhzOk;
   doc["heating"]     = mhzHeating;
   doc["heatLeft"]    = mhzHeating
                          ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
                          : 0;
-  doc["timestamp"]   = latest.timestamp;
+  doc["timestamp"]   = r.timestamp;
   bool timeOk        = (time(nullptr) > 1000000);
   doc["timeOk"]      = timeOk;
   if (timeOk) {
-    doc["datetime"] = fmtTime(latest.timestamp);
+    doc["datetime"] = fmtTime(r.timestamp);
   } else {
     doc["datetime"] = "NTP ожидание...";
   }
@@ -482,11 +525,15 @@ static String jsonCurrent() {
   doc["ip"]           = WiFi.localIP().toString();
   doc["mdns"]         = String(MDNS_HOST) + ".local";
   doc["mdnsOk"]       = mdnsStarted;
-  doc["nextLogInSec"] = (timeSynced && time(nullptr) > 1000000)
-                            ? ((lastLogMs + saveIntervalMs > millis())
-                                   ? (lastLogMs + saveIntervalMs - millis()) / 1000
-                                   : 0)
-                            : 0;
+  // Разность millis() (беззнаковая) переживает переполнение счётчика,
+  // в отличие от lastLogMs + saveIntervalMs.
+  uint32_t nextIn = 0;
+  if (timeSynced && time(nullptr) > 1000000) {
+    uint32_t elapsed = millis() - lastLogMs;
+    if (elapsed < saveIntervalMs)
+      nextIn = (saveIntervalMs - elapsed) / 1000;
+  }
+  doc["nextLogInSec"] = nextIn;
   doc["pointSec"]     = pointIntervalMs / 1000;
   doc["saveMin"]      = saveIntervalMs / 60000;
   int lvHead, lvCount;
@@ -503,9 +550,7 @@ static String jsonCurrent() {
   }
   doc["firstTs"]      = firstTs;
   doc["pointsSeq"]    = pointsSeq;
-  String out;
-  serializeJson(doc, out);
-  return out;
+  return serializeJson(doc, buf, n);
 }
 
 // --- История: компактная точка (файловые записи тоже храним так, а не строками) ---
@@ -588,11 +633,9 @@ static void printPoint(Print &out, const HPoint &p, bool &first) {
   out.print(buf);
 }
 
-// Догрузка только новых точек (для живого обновления графиков).
-// Отвечает из ОЗУ, файлы не читает — ответ крошечный.
 // Догрузка только новых точек (живое обновление графиков).
-// Ответ отдаём потоком: раньше всё собиралось в одну String, и при since=0
-// (мусорный/старый параметр) это было до ~90 КБ — OOM и перезагрузка.
+// Отвечает из ОЗУ, файлы не читает — ответ крошечный. Размер всё равно
+// ограничен (см. ниже): AsyncResponseStream держит весь ответ в String.
 static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
   AsyncResponseStream *resp = req->beginResponseStream("application/json");
   resp->print('[');
@@ -600,9 +643,21 @@ static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
   int  lh, lc;
   liveSnapshot(lh, lc);
   int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  // AsyncResponseStream держит ответ в String, поэтому размер ответа ограничен:
+  // если вкладка долго была в фоне и since сильно устарел, точек новее него
+  // может быть до MAX_LIVE_POINTS (~2 ч) — отдаём только последние
+  // MAX_HISTORY_OUT, остальное доберётся полной перезагрузкой раз в 2 минуты.
+  int fresh = 0;
   for (int i = 0; i < lc; i++) {
+    if (liveGet((start + i) % MAX_LIVE_POINTS).ts > since)
+      fresh++;
+  }
+  int skip = (fresh > MAX_HISTORY_OUT) ? fresh - MAX_HISTORY_OUT : 0;
+  for (int i = 0, seen = 0; i < lc; i++) {
     Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
     if (sp.ts <= since)
+      continue;
+    if (seen++ < skip)
       continue;
     printPoint(*resp, HPoint{sp.ts, sp.t, sp.h, sp.co2}, first);
   }
@@ -633,6 +688,11 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
     firstPass++;
   }
   int liveAfter = lc - firstPass;
+  // Последняя точка на момент снимка. Пока читаем файлы, loop может успеть
+  // записать новую точку и затереть самый старый слот кольца; выборку из ОЗУ
+  // делаем после файлов, поэтому отсекаем «чужие» ts по этому ориентиру —
+  // иначе на стыке файловой и живой части появился бы скачок.
+  uint32_t liveNewest = lc ? liveGet((start + lc - 1) % MAX_LIVE_POINTS).ts : 0;
 
   // --- сколько строк нужно добрать из файлов ---
   int need;
@@ -721,11 +781,14 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
     int off = (liveAfter - 1) % step;
     for (int k = off; k < liveAfter; k += step) {
       Point sp = liveGet((start + firstPass + k) % MAX_LIVE_POINTS);
+      if (sp.ts == 0 || sp.ts < oldestLive || sp.ts > liveNewest)
+        continue;   // слот успел перезаписаться во время чтения файлов
       outv.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
     }
   }
 
-  // ответ отдаём потоком: JSON целиком в памяти не собираем
+  // Отдаём через AsyncResponseStream: он держит ответ в String, поэтому число
+  // точек жёстко ограничено maxOut (≤ MAX_HISTORY_OUT) — ответ ≈ 24 КБ.
   AsyncResponseStream *resp = req->beginResponseStream("application/json");
   resp->print('[');
   bool firstItem = true;
@@ -950,7 +1013,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
       <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
     </div>
   </div>
-  <div class="panel"><h2>Последние записи</h2><div style="overflow-x:auto"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
+  <div class="panel"><h2>Последние записи</h2><div class="tblwrap"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
 </div>
 
 </main>
@@ -1086,7 +1149,7 @@ function drawChart(cv,color,label,data,yfield,w){
  g.fillText(label,pad.l,11);
 }
 
-async function api(u){const r=await fetch(u);return r.json();}
+async function api(u){const r=await fetch(u,{cache:'no-store'});return r.json();}
 
 async function pollLive(){
  try{
@@ -1121,7 +1184,12 @@ async function pollLive(){
  setTimeout(pollLive,5000);}
 
 let chartsTimer=null;
+let chartsBusy=false, chartsQueued=false, chartsQueuedFull=false;
 async function loadCharts(full){
+ // Запросы не пересекаем: полная загрузка и лёгкая дельта могли бы вернуться
+ // вразнобой и перемешать hist/histRange (гонка на async без токена).
+ if(chartsBusy){ chartsQueued=true; chartsQueuedFull=chartsQueuedFull||!!full; return; }
+ chartsBusy=true;
  try{
   const hours=$('rangeSel').value;
   const hrs=parseFloat(hours)||0;
@@ -1147,8 +1215,10 @@ async function loadCharts(full){
   if(hist.length>cap)hist=hist.slice(hist.length-cap);
   drawAll();
   updateLogBadge();
- }catch(e){}}
-
+ }catch(e){}
+ chartsBusy=false;
+ if(chartsQueued){ const f=chartsQueuedFull; chartsQueued=false; chartsQueuedFull=false; loadCharts(f); }
+}
 function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(()=>loadCharts(true),120000); }
 
 async function loadData(){
@@ -1245,13 +1315,127 @@ setInterval(tickUptime,1000);
 </body>
 </html>)rawliteral";
 
+// --- Выгрузка логов в CSV (chunked) ---
+// AsyncResponseStream хранит весь ответ в String (StreamString): на экспорте в
+// сотни КБ это OOM. Отдаём ответ chunked-потоком — библиотека сама запрашивает
+// следующие порции, а мы читаем файлы по мере отправки и держим в памяти
+// только одну строку. Файлы открываем без удержания мьютекса между вызовами.
+struct ExportCtx {
+  std::vector<String> names;
+  size_t              idx       = 0;
+  File                f;
+  size_t              headerPos = 0;   // сколько байт заголовка CSV уже отдано
+  char                pending[168];    // хвост строки, не влезший в буфер
+  size_t              pendingLen = 0;
+};
+
+// Следующая непустая строка данных (заголовок пропускаем). false — конец.
+static bool exportNextLine(ExportCtx &c, char *line, size_t n) {
+  while (c.idx < c.names.size()) {
+    if (!c.f) {
+      c.f = LittleFS.open(c.names[c.idx], "r");
+      if (!c.f) { c.idx++; continue; }
+    }
+    if (!c.f.available()) { c.f.close(); c.idx++; continue; }
+    size_t ln = c.f.readBytesUntil('\n', line, n - 1);
+    if (ln == 0) { c.f.close(); c.idx++; continue; }
+    line[ln] = 0;
+    if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+// Filler chunked-ответа: заполняет буфер очередными строками CSV. Всегда
+// пишет хотя бы байт, если данные ещё есть, иначе библиотека сочтёт ответ
+// законченным. Возврат 0 = всё отдано.
+static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
+  ExportCtx *c   = (ExportCtx *)ctx;
+  size_t     out = 0;
+  static const char H[] = "timestamp,datetime,temperature,humidity,co2\n";
+  const size_t      HL  = sizeof(H) - 1;
+
+  // Свободного места под ответ нет. Если данные ещё остались, просим вызвать
+  // позже (RESPONSE_TRY_AGAIN): вернуть 0 нельзя — библиотека сочтёт ответ
+  // завершённым и обрежет выгрузку.
+  if (maxLen == 0) {
+    if (c->headerPos < HL || c->pendingLen)
+      return RESPONSE_TRY_AGAIN;
+    char peek[160];
+    if (!exportNextLine(*c, peek, sizeof(peek)))
+      return 0;                        // данных больше нет — ответ завершён
+    size_t pn = strlen(peek);
+    memcpy(c->pending, peek, pn);
+    c->pending[pn] = '\n';
+    c->pendingLen  = pn + 1;
+    return RESPONSE_TRY_AGAIN;
+  }
+
+  bool locked = fsLock(2000);      // держим только на время чтения строк
+  char line[160];
+
+  while (out < maxLen) {
+    if (c->headerPos < HL) {       // заголовок CSV (может не влезть целиком)
+      size_t take = HL - c->headerPos;
+      if (take > maxLen - out)
+        take = maxLen - out;
+      memcpy(buf + out, H + c->headerPos, take);
+      out += take;
+      c->headerPos += take;
+      continue;
+    }
+    if (c->pendingLen) {           // хвост предыдущей строки
+      size_t take = c->pendingLen;
+      if (take > maxLen - out)
+        take = maxLen - out;
+      memcpy(buf + out, c->pending, take);
+      out += take;
+      if (take < c->pendingLen) {
+        memmove(c->pending, c->pending + take, c->pendingLen - take);
+        c->pendingLen -= take;
+        break;                     // буфер заполнен
+      }
+      c->pendingLen = 0;
+      continue;
+    }
+    if (!exportNextLine(*c, line, sizeof(line)))
+      break;                       // строки кончились — ответ завершён
+    size_t ll = strlen(line);
+    size_t take = ll;
+    if (take > maxLen - out)
+      take = maxLen - out;
+    memcpy(buf + out, line, take);
+    out += take;
+    if (take < ll) {               // вся строка не влезла — хвост придержим
+      memcpy(c->pending, line + take, ll - take);
+      c->pending[ll - take] = '\n';
+      c->pendingLen         = ll - take + 1;
+      break;
+    }
+    if (out < maxLen) {
+      buf[out++] = '\n';
+    } else {
+      c->pending[0] = '\n';
+      c->pendingLen = 1;
+      break;
+    }
+  }
+
+  if (locked)
+    fsUnlock();
+  return out;
+}
+
 static void setupWeb() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     req->send_P(200, "text/html", INDEX_HTML);
   });
 
   server.on("/api/current", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "application/json", jsonCurrent());
+    char buf[768];
+    jsonCurrent(buf, sizeof(buf));
+    req->send(200, "application/json", buf);
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -1265,9 +1449,10 @@ static void setupWeb() {
     // ?points=N — N последних точек (таблица «Последние записи»)
     if (req->hasParam("points")) {
       int pts = (int)req->getParam("points")->value().toInt();
-      // Верхнюю границу держим по числу читаемых строк: иначе outv.reserve()
-      // на десятки тысяч точек выделяет сотни КБ и валит устройство в OOM.
-      pts = constrain(pts, 10, MAX_FILE_ROWS);
+      // Верхнюю границу держим небольшой: AsyncResponseStream копит весь ответ
+      // в String, и большое N — это десятки КБ на куче впустую. Таблице нужно
+      // 50 точек, полную историю графики запрашивают отдельно (?hours).
+      pts = constrain(pts, 10, MAX_HISTORY_OUT);
       sendHistory(req, 0, pts);
       return;
     }
@@ -1327,30 +1512,23 @@ static void setupWeb() {
   });
 
   server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req) {
-    // Отдаём CSV потоком: раньше вся история собиралась в одну String
-    // (до сотен КБ) — это гарантированный OOM при скачивании логов.
-    AsyncResponseStream *resp = req->beginResponseStream("text/csv");
-    resp->print("timestamp,datetime,temperature,humidity,co2\n");
+    // Список файлов собираем под мьютексом (составная операция), а сами файлы
+    // читаем по мере отправки chunked-ответа: весь CSV в ОЗУ не собирается,
+    // строка читается под мьютексом, между вызовами он свободен.
     std::vector<String> names;
-    listFiles(LOGS_DIR, names);
+    if (fsLock(2000)) {
+      listFiles(LOGS_DIR, names);
+      fsUnlock();
+    }
     for (size_t i = 0; i < names.size(); i++)
       for (size_t j = i + 1; j < names.size(); j++)
         if (names[j] < names[i])
           std::swap(names[i], names[j]);
-    for (auto &n : names) {
-      File f = LittleFS.open(n, "r");
-      if (!f)
-        continue;
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        if (line.length() && !line.startsWith("timestamp")) {
-          resp->print(line);
-          resp->print('\n');
-        }
-      }
-      f.close();
-    }
-    req->send(resp);
+    auto ctx   = std::make_shared<ExportCtx>();
+    ctx->names = std::move(names);
+    req->sendChunked("text/csv", [ctx](uint8_t *buf, size_t maxLen, size_t) -> size_t {
+      return exportFill(ctx.get(), buf, maxLen);
+    });
   });
 
   server.on("/api/wifi/save", HTTP_POST, [](AsyncWebServerRequest *req) {
@@ -1422,11 +1600,11 @@ static void setupWeb() {
     JsonDocument doc;
     doc["range"] = range;
     doc["abc"]   = abc;
-    doc["co2"]   = latest.co2;
+    doc["co2"]   = getLatest().co2;
     doc["mhzOk"] = mhzOk;
     doc["heating"] = mhzHeating;
-    String out;
-    serializeJson(doc, out);
+    char out[192];
+    serializeJson(doc, out, sizeof(out));
     req->send(200, "application/json", out);
   });
 
@@ -1473,6 +1651,8 @@ static void setupWeb() {
 // ВАЖНО: в этом ядре ESPmDNS не подписывается на события сети (подписка
 // закомментирована в ESPmDNS.cpp), поэтому если Wi-Fi поднялся ПОСЛЕ старта,
 // или произошёл реконнект — mDNS нужно перезапустить вручную (mdnsRestart).
+static uint32_t lastMdnsStaIp = 0;   // STA-адрес, для которого mDNS уже зарегистрирован
+
 static void startMdns() {
   if (mdnsStarted && !mdnsRestart)
     return;
@@ -1484,6 +1664,12 @@ static void startMdns() {
 
   if (mdnsRestart) {
     mdnsRestart = false;
+    // MDNS.end()+begin() освобождает и заново выделяет память. При обычном
+    // переподключении к той же сети DHCP чаще всего отдаёт тот же адрес —
+    // регистрация остаётся верной, и перезапуск только фрагментирует heap.
+    if (mdnsStarted && WiFi.status() == WL_CONNECTED &&
+        lastMdnsStaIp != 0 && (uint32_t)WiFi.localIP() == lastMdnsStaIp)
+      return;
     if (mdnsStarted) {
       MDNS.end();            // перерегистрируемся на новом интерфейсе
       mdnsStarted = false;
@@ -1499,7 +1685,8 @@ static void startMdns() {
   }
   MDNS.setInstanceName("Climat Monitor");
   MDNS.addService("http", "tcp", 80);
-  mdnsStarted = true;
+  mdnsStarted    = true;
+  lastMdnsStaIp  = (WiFi.status() == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
   Serial.printf("[MDNS] открыть: http://%s.local (%s, IP %s)\n", MDNS_HOST,
                 apMode ? "AP" : "STA",
                 apMode ? WiFi.softAPIP().toString().c_str()
@@ -1606,7 +1793,7 @@ void setup() {
   setupWeb();
 
   readSensors();
-  latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+  setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
   lastLogMs        = millis();
   lastPointMs      = millis();
   Serial.printf("[INIT] точка каждые %lu с, сохранение в файл каждые %lu мин\n",
@@ -1628,14 +1815,14 @@ void loop() {
 
   if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
     lastPointMs      = millis();
-    latest.timestamp = (uint32_t)time(nullptr);
+    setLatestTs((uint32_t)time(nullptr));
     if ((dhtOk || mhzOk) && !mhzHeating)
       pushLivePoint(latest);
   }
 
   if (millis() - lastLogMs >= saveIntervalMs) {
     lastLogMs        = millis();
-    latest.timestamp = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+    setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
     if ((dhtOk || mhzOk) && !mhzHeating)
       logReading(latest);
   }

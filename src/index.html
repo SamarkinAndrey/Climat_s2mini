@@ -765,8 +765,6 @@
         let html = '';
         rows.forEach(d => { html += `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`; });
         tb.innerHTML = html;
-        // В таблице — фактические строки (последние, не более 50). Всего записей —
-        // столько же, сколько в бейдже: строки файлов + точки в ОЗУ.
         const shownN = rows.length;
         const totalN = Math.max(shownN, statsFiles + statsRam);
         const note = shownN < totalN

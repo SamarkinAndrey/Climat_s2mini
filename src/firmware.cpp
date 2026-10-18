@@ -194,7 +194,12 @@ static void rotateLogsIfNeeded() {
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
 
-  while (names.size() > MAX_LOG_FILES) {
+  // Удаление файлов из LittleFS блокирует loop-задачу на десятки миллисекунд
+  // и вызывает пиковое потребление по 3V3. Ограничиваем число удалений за
+  // один проход, чтобы редкая ротация не совпадала по времени с записью
+  // точки и Wi-Fi-запросами (подозрение на brownout-перезагрузки).
+  int removed = 0;
+  while (names.size() > MAX_LOG_FILES && removed < 2) {
     int oldestIdx = 0;
     for (size_t i = 1; i < names.size(); i++)
       if (names[i] < names[oldestIdx])
@@ -204,39 +209,7 @@ static void rotateLogsIfNeeded() {
     logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
-    // самая ранняя запись теперь в самом старом из оставшихся файлов
-    oldestSavedTs = 0;
-    if (!names.empty()) {
-      int oi = 0;
-      for (size_t i = 1; i < names.size(); i++)
-        if (names[i] < names[oi])
-          oi = i;
-      oldestSavedTs = firstFileTs(names[oi]);
-    }
   }
-}
-
-// Пересчёт числа записей по всем лог-файлам — только на старте (одно чтение
-// файлов), дальше счётчик ведётся инкрементально.
-static void recountLogRows() {
-  std::vector<String> names;
-  listFiles(LOGS_DIR, names);
-  uint32_t total = 0;
-  for (const String &n : names)
-    total += countFileRows(n);
-  logRowsTotal = total;
-
-  oldestSavedTs = 0;
-  if (!names.empty()) {
-    int oi = 0;
-    for (size_t i = 1; i < names.size(); i++)
-      if (names[i] < names[oi])
-        oi = i;                          // файлы названы по дате, свежие — в конце
-    oldestSavedTs = firstFileTs(names[oi]);
-  }
-  Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
-                (unsigned)names.size(), (unsigned long)total,
-                (unsigned long)oldestSavedTs);
 }
 
 static void logReading(const Reading &r) {
@@ -352,7 +325,14 @@ static void tryNtp() {
   if (now - lastNtpTry < 10000)
     return;
   lastNtpTry = now;
-  configTime(3 * 3600, 0, NTP_SERVER);
+  // configTime() каждый раз создаёт новый SNTP-контекст/задачу — при
+  // вызовах каждые 10 с это утечка heap и лишняя нагрузка на Wi-Fi стек.
+  // Настраиваем синхронизацию один раз, дальше только читаем время.
+  static bool sntpConfigured = false;
+  if (!sntpConfigured) {
+    configTime(3 * 3600, 0, NTP_SERVER);
+    sntpConfigured = true;
+  }
   time_t tt = time(nullptr);
   if (tt > 1000000 && !timeSynced) {
     timeSynced = true;
@@ -849,7 +829,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
       <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
     </div>
   </div>
-  <div class="panel"><h2>Последние записи</h2><div class="tblwrap"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
+  <div class="panel"><h2>Последние записи</h2><div style="overflow-x:auto"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
 </div>
 
 </main>
@@ -940,11 +920,13 @@ function drawChart(id,color,label,data,yfield){
   g.fillText(fs,pad.l,h-8);
   g.fillText(ls,w-pad.r-g.measureText(ls).width,h-8);
   g.beginPath(); g.strokeStyle=color; g.lineWidth=2;
-  data.forEach((d,i)=>{
+  for(let i=0;i<data.length;i++){
+   const d=data[i];
    const x=(data.length>1)?X(d.ts):pad.l+pw/2;
-   const y=pad.t+ph*(1-(vals[i]-min)/(max-min));
+   let v=Number(d[yfield]); if(!isFinite(v))v=0;
+   const y=pad.t+ph*(1-(v-min)/(max-min));
    i?g.lineTo(x,y):g.moveTo(x,y);
-  });
+  }
   g.stroke();
   g.lineTo(pad.l+pw,pad.t+ph); g.lineTo(pad.l,pad.t+ph); g.closePath();
   g.fillStyle=color+'22'; g.fill();
@@ -1020,10 +1002,13 @@ async function loadData(){
  try{
   const files=await api('/api/files');
   $('files').innerHTML=files.length?('Файлов: '+files.length+'<br>'+files.join('<br>')):'Нет файлов';
-  const h=await api('/api/history?points=200');
+  const h=await api('/api/history?points=50');
   const tb=$('tbl').querySelector('tbody');tb.innerHTML='';
-  h.slice().reverse().forEach(d=>{tb.insertAdjacentHTML('beforeend',
-   `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`);});
+  const rows=h.slice(-50).reverse();
+  let html='';
+  rows.forEach(d=>{html+=`<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`;});
+  tb.innerHTML=html;
+  $('files').innerHTML+='<br><span style="color:var(--mut)">Показаны последние 50 из '+h.length+' запрошенных точек. Полные данные — в графиках и CSV.</span>';
  }catch(e){}}
 
 async function saveWifi(){
@@ -1361,21 +1346,14 @@ static void setupNetwork() {
   }
 }
 
+// Диагностика перезагрузок: печатаем причину последнего сброса и свободную
+// память. ESP_RST_BROWNOUT = просадка 3V3 при пике тока (запись flash +
+// Wi-Fi + преднагрев MH-Z19) — главный кандидат при «перезагрузках каждые
+// 5 минут». freeHeap по boot'ам показывает возможные утечки памяти.
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== Climat Monitor ===");
-
-  // Часы ESP32 (RTC) держат время между перезагрузками, а при прошивке питание
-  // не снимается — значит до NTP время уже верное. Без этого первый запрос
-  // истории уходил с since=0 и графики строились «за всё время».
-  {
-    time_t rtcNow = time(nullptr);
-    if (rtcNow > 1000000) {
-      timeSynced = true;
-      Serial.printf("[NTP] время уже есть (RTC): %lu\n", (unsigned long)rtcNow);
-    }
-  }
 
   prefs.begin("cfg", false);
 

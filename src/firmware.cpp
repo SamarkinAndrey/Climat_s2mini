@@ -457,16 +457,20 @@ static uint64_t uptimeMsTotal() {
 
 static size_t jsonCurrent(char *buf, size_t n) {
   JsonDocument doc;
+
+  // heating и heatLeft считаем из одного свежего elapsed: mhzHeating обновляется
+  // только раз в 5 с в readSensors(), поэтому на границе прогрева heatLeft уходил в мусор.
+  uint32_t heatElapsed = millis() - heatingStartMs;
+  bool     heatingNow  = (heatElapsed < MHZ19_HEATING_TIME);
+
   Reading      r     = getLatest();
   doc["temperature"] = r.temperature;
   doc["humidity"]    = r.humidity;
   doc["co2"]         = r.co2;
   doc["dhtOk"]       = dhtOk;
   doc["mhzOk"]       = mhzOk;
-  doc["heating"]     = mhzHeating;
-  doc["heatLeft"]    = mhzHeating
-                           ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
-                           : 0;
+  doc["heating"]     = heatingNow;
+  doc["heatLeft"]    = heatingNow ? (int)((MHZ19_HEATING_TIME - heatElapsed) / 1000UL) : 0;
   doc["timestamp"]   = r.timestamp;
   bool timeOk        = (time(nullptr) > 1000000);
   doc["timeOk"]      = timeOk;

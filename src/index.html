@@ -788,7 +788,9 @@
         $('v-co2').classList.toggle('heat', heat);
         if (heat) {
           $('v-co2').innerHTML = '♨️';
-          $('s-mhz').innerHTML = '<span class="heat">идёт прогрев, ' + (s.heatLeft || 0) + ' с</span>';
+          let hl = Math.round(Number(s.heatLeft) || 0);
+          if (!(hl >= 0 && hl <= 600)) hl = 0; // защита от мусора в конце прогрева
+          $('s-mhz').innerHTML = '<span class="heat">идёт прогрев, ' + hl + ' с</span>';
         } else {
           $('v-co2').innerHTML = s.co2;
           $('s-mhz').innerHTML = s.mhzOk ? '<span class="ok"></span>' : '<span class="bad">MH-Z19 нет связи</span>';

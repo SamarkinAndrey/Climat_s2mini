@@ -34,7 +34,12 @@
 #define MIN_SAVE_MIN      1
 #define MAX_SAVE_MIN      1440
 #define MAX_LIVE_POINTS   1440
-#define MAX_HISTORY_OUT   800
+// Предел точек в одном ответе истории. Больше не нужно: график на телефоне
+// ~360 px шириной, 400 точек уже плотнее пикселя, а отрисовка заметно медленнее.
+#define MAX_HISTORY_OUT   400
+// Сколько строк вообще читаем из файлов (16 байт на точку). Нужно, чтобы
+// длинный период (5 суток) покрывался целиком, а прореживание шло уже потом.
+#define MAX_FILE_ROWS     1500
 
 const char *AP_SSID = "CO2Monitor";
 const char *AP_PASS = "12345678";
@@ -72,6 +77,11 @@ bool     timeSynced      = false;
 uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;
 uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL;
 uint32_t pointsSeq       = 0;
+// Всего записей в лог-файлах (без заголовков): считается один раз на старте
+// и дальше только инкрементируется — читать файлы на каждый запрос не нужно.
+uint32_t logRowsTotal    = 0;
+// Время самой ранней сохранённой записи (для подсчёта покрытого периода).
+uint32_t oldestSavedTs   = 0;
 
 struct Point {
   uint32_t ts;
@@ -87,12 +97,16 @@ int   liveCount = 0;
 String cfgSsid, cfgPass;
 int    mhzRange = 5000;
 
-static String fmtTime(uint32_t ts) {
+static void fmtTimeBuf(uint32_t ts, char *buf, size_t n) {
   struct tm t;
   time_t    tt = ts;
   localtime_r(&tt, &t);
+  strftime(buf, n, "%Y-%m-%d %H:%M:%S", &t);
+}
+
+static String fmtTime(uint32_t ts) {
   char buf[24];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+  fmtTimeBuf(ts, buf, sizeof(buf));
   return String(buf);
 }
 
@@ -134,6 +148,48 @@ static void listFiles(const char *dirPath, std::vector<String> &out) {
   dir.close();
 }
 
+// Число строк данных в лог-файле (заголовок не считаем). Читаем блоками, не
+// парсим содержимое — важно только количество переводов строк.
+static uint32_t countFileRows(const String &path) {
+  File f = LittleFS.open(path, "r");
+  if (!f)
+    return 0;
+  uint32_t lines = 0;
+  char     last  = '\n';
+  uint8_t  buf[256];
+  while (true) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (!n)
+      break;
+    for (size_t i = 0; i < n; i++) {
+      if (buf[i] == '\n')
+        lines++;
+      last = (char)buf[i];
+    }
+  }
+  f.close();
+  if (!lines)
+    return 0;
+  if (last != '\n')
+    lines++;           // файл без перевода строки в конце
+  return lines - 1;    // минус строка-заголовок
+}
+
+// Unix-время первой (самой ранней) записи в файле — нужна для бейджа
+// «Записей», где часы считаются от самой первой сохранённой точки.
+static uint32_t firstFileTs(const String &path) {
+  File f = LittleFS.open(path, "r");
+  if (!f)
+    return 0;
+  f.readStringUntil('\n');              // заголовок
+  String line = f.readStringUntil('\n'); // первая строка данных
+  f.close();
+  int comma = line.indexOf(',');
+  if (comma <= 0)
+    return 0;
+  return (uint32_t)strtoul(line.substring(0, comma).c_str(), nullptr, 10);
+}
+
 static void rotateLogsIfNeeded() {
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
@@ -144,9 +200,43 @@ static void rotateLogsIfNeeded() {
       if (names[i] < names[oldestIdx])
         oldestIdx = i;
     Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
+    uint32_t gone = countFileRows(names[oldestIdx]);
+    logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
+    // самая ранняя запись теперь в самом старом из оставшихся файлов
+    oldestSavedTs = 0;
+    if (!names.empty()) {
+      int oi = 0;
+      for (size_t i = 1; i < names.size(); i++)
+        if (names[i] < names[oi])
+          oi = i;
+      oldestSavedTs = firstFileTs(names[oi]);
+    }
   }
+}
+
+// Пересчёт числа записей по всем лог-файлам — только на старте (одно чтение
+// файлов), дальше счётчик ведётся инкрементально.
+static void recountLogRows() {
+  std::vector<String> names;
+  listFiles(LOGS_DIR, names);
+  uint32_t total = 0;
+  for (const String &n : names)
+    total += countFileRows(n);
+  logRowsTotal = total;
+
+  oldestSavedTs = 0;
+  if (!names.empty()) {
+    int oi = 0;
+    for (size_t i = 1; i < names.size(); i++)
+      if (names[i] < names[oi])
+        oi = i;                          // файлы названы по дате, свежие — в конце
+    oldestSavedTs = firstFileTs(names[oi]);
+  }
+  Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
+                (unsigned)names.size(), (unsigned long)total,
+                (unsigned long)oldestSavedTs);
 }
 
 static void logReading(const Reading &r) {
@@ -169,6 +259,7 @@ static void logReading(const Reading &r) {
   f.printf("%lu,%s,%.2f,%.2f,%u\n", r.timestamp, fmtTime(r.timestamp).c_str(),
            r.temperature, r.humidity, r.co2);
   f.close();
+  logRowsTotal++;
   pointsSeq++;
   Serial.printf("[LOG] записано в %s: %.1fC %.1f%% %uppm\n",
                 path.c_str(), r.temperature, r.humidity, r.co2);
@@ -280,6 +371,17 @@ static void tryNtp() {
   }
 }
 
+// millis() переполняется через 49,7 суток, поэтому время работы накапливаем
+// отдельно: unsigned-разность корректно переживает переполнение счётчика.
+static uint64_t uptimeMsTotal() {
+  static uint32_t last  = 0;
+  static uint64_t total = 0;
+  uint32_t        now   = millis();
+  total += (uint32_t)(now - last);
+  last = now;
+  return total;
+}
+
 static String jsonCurrent() {
   JsonDocument doc;
   doc["temperature"] = latest.temperature;
@@ -292,12 +394,14 @@ static String jsonCurrent() {
                          ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
                          : 0;
   doc["timestamp"]   = latest.timestamp;
-  if (timeSynced && time(nullptr) > 1000000) {
+  bool timeOk        = (time(nullptr) > 1000000);
+  doc["timeOk"]      = timeOk;
+  if (timeOk) {
     doc["datetime"] = fmtTime(latest.timestamp);
   } else {
     doc["datetime"] = "NTP ожидание...";
   }
-  doc["uptime"]       = millis() / 1000;
+  doc["uptime"]       = (uint32_t)(uptimeMsTotal() / 1000);
   doc["mode"]         = apMode ? "AP" : "STA";
   doc["ip"]           = WiFi.localIP().toString();
   doc["mdns"]         = String(MDNS_HOST) + ".local";
@@ -310,35 +414,148 @@ static String jsonCurrent() {
   doc["pointSec"]     = pointIntervalMs / 1000;
   doc["saveMin"]      = saveIntervalMs / 60000;
   doc["points"]       = liveCount;
+  doc["logRows"]      = logRowsTotal;   // всего записей в файлах
+  // Самая ранняя из сохранённых точек: файлы (если есть) либо начало ОЗУ.
+  uint32_t firstTs = oldestSavedTs;
+  if (liveCount) {
+    uint32_t ramFirst = liveBuf[(liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS].ts;
+    if (ramFirst && (!firstTs || ramFirst < firstTs))
+      firstTs = ramFirst;
+  }
+  doc["firstTs"]      = firstTs;
   doc["pointsSeq"]    = pointsSeq;
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-static String jsonHistory(int points) {
-  if (points < 1)
-    points = 1;
-  if (points > 20000)
-    points = 20000;
+// --- История: компактная точка (файловые записи тоже храним так, а не строками) ---
+struct HPoint {
+  uint32_t ts;
+  float    t;
+  float    h;
+  uint16_t co2;
+};
 
-  std::vector<Point> live;
+// Читает из файла ТОЛЬКО последние maxRows строк.
+// Раньше файл целиком загружался в вектор String — на больших файлах это
+// съедало всю память и устройство перезагружалось.
+static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &out) {
+  out.clear();
+  if (maxRows < 1)
+    return;
+  File f = LittleFS.open(path, "r");
+  if (!f)
+    return;
+
+  std::vector<HPoint> ring(maxRows);
+  int                 cnt = 0, head = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    int    p1   = line.indexOf(',');
+    if (p1 <= 0 || line.startsWith("timestamp"))
+      continue;
+    int p2 = line.indexOf(',', p1 + 1);
+    int p3 = line.indexOf(',', p2 + 1);
+    int p4 = line.indexOf(',', p3 + 1);
+    if (p2 < 0 || p3 < 0 || p4 < 0)
+      continue;
+    uint32_t ts = (uint32_t)line.substring(0, p1).toInt();
+    if (ts == 0)
+      continue;
+    HPoint &p = ring[head];
+    p.ts      = ts;
+    p.t       = line.substring(p2 + 1, p3).toFloat();
+    p.h       = line.substring(p3 + 1, p4).toFloat();
+    p.co2     = (uint16_t)line.substring(p4 + 1).toInt();
+    head      = (head + 1) % maxRows;
+    if (cnt < maxRows)
+      cnt++;
+  }
+  f.close();
+
+  int start = (head - cnt + maxRows) % maxRows;
+  out.reserve(cnt);
+  for (int i = 0; i < cnt; i++)
+    out.push_back(ring[(start + i) % maxRows]);
+}
+
+static void fmtPoint(char *buf, size_t n, const HPoint &p) {
+  char dt[24];
+  fmtTimeBuf(p.ts, dt, sizeof(dt));
+  snprintf(buf, n,
+           "{\"ts\":%lu,\"dt\":\"%s\",\"t\":%.1f,\"h\":%.1f,\"co2\":%u}",
+           (unsigned long)p.ts, dt, p.t, p.h, p.co2);
+}
+
+static void printPoint(Print &out, const HPoint &p, bool &first) {
+  if (!first)
+    out.print(',');
+  first = false;
+  char buf[160];
+  fmtPoint(buf, sizeof(buf), p);
+  out.print(buf);
+}
+
+// Догрузка только новых точек (для живого обновления графиков).
+// Отвечает из ОЗУ, файлы не читает — ответ крошечный.
+static String jsonHistorySince(uint32_t since) {
+  String out   = "[";
+  bool   first = true;
+  int    start = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  for (int i = 0; i < liveCount; i++) {
+    const Point &sp = liveBuf[(start + i) % MAX_LIVE_POINTS];
+    if (sp.ts <= since)
+      continue;
+    HPoint p{sp.ts, sp.t, sp.h, sp.co2};
+    if (!first)
+      out += ',';
+    first = false;
+    char buf[160];
+    fmtPoint(buf, sizeof(buf), p);
+    out += buf;
+  }
+  out += "]";
+  return out;
+}
+
+// since=0 — без ограничения по времени; lastN>0 — «последние N точек» (для таблицы).
+static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
+  int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
+
+  // --- точки из ОЗУ (высокое разрешение) ---
+  std::vector<HPoint> live;
   live.reserve(liveCount);
   int first = (liveHead - liveCount + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-  for (int i = 0; i < liveCount; i++)
-    live.push_back(liveBuf[(first + i) % MAX_LIVE_POINTS]);
+  for (int i = 0; i < liveCount; i++) {
+    const Point &sp = liveBuf[(first + i) % MAX_LIVE_POINTS];
+    if (sp.ts == 0 || (since && sp.ts < since))
+      continue;
+    live.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
+  }
   uint32_t oldestLive = live.empty() ? 0xFFFFFFFFu : live.front().ts;
 
-  int fromFile = points - (int)live.size();
-  if (fromFile < 0) {
-    live.erase(live.begin(), live.begin() + ((int)live.size() - points));
-    fromFile = 0;
+  // --- сколько строк нужно добрать из файлов ---
+  int need;
+  if (lastN > 0) {
+    need = lastN - (int)live.size();
+  } else if (since && oldestLive != 0xFFFFFFFFu) {
+    uint32_t saveSec = saveIntervalMs / 1000UL;
+    if (saveSec < 60)
+      saveSec = 60;
+    uint32_t sec = (oldestLive > since) ? (oldestLive - since) : 0;
+    need         = (int)(sec / saveSec) + 2;
+    if (need > MAX_FILE_ROWS)
+      need = MAX_FILE_ROWS;
+  } else {
+    need = MAX_FILE_ROWS;
   }
-  if (fromFile > MAX_HISTORY_OUT)
-    fromFile = MAX_HISTORY_OUT;
+  if (need < 0)
+    need = 0;
 
-  std::vector<String> rows;
-  if (fromFile > 0) {
+  // --- точки из файлов (только хвосты, файл целиком не читаем) ---
+  std::vector<HPoint> rows;
+  if (need > 0) {
     std::vector<String> names;
     listFiles(LOGS_DIR, names);
     for (size_t i = 0; i < names.size(); i++)
@@ -346,66 +563,75 @@ static String jsonHistory(int points) {
         if (names[j] < names[i])
           std::swap(names[i], names[j]);
 
-    for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < fromFile; fi--) {
-      File f = LittleFS.open(names[fi], "r");
-      if (!f)
+    std::vector<std::vector<HPoint>> chunks;
+    int                             totalRows = 0;
+    for (int fi = (int)names.size() - 1; fi >= 0 && totalRows < need; fi--) {
+      int perFile = need - totalRows;
+      if (perFile > 600)
+        perFile = 600;   // кольцо на файл ограничиваем, чтобы не раздувать heap
+      std::vector<HPoint> tail;
+      readFileTail(names[fi], perFile, tail);
+      if (tail.empty())
         continue;
-      std::vector<String> fileRows;
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() && line.indexOf(',') > 0 && !line.startsWith("timestamp"))
-          fileRows.push_back(line);
-      }
-      f.close();
-
-      for (int i = (int)fileRows.size() - 1; i >= 0 && (int)rows.size() < fromFile; i--) {
-        int c = fileRows[i].indexOf(',');
-        if (c <= 0)
-          continue;
-        uint32_t ts = (uint32_t)fileRows[i].substring(0, c).toInt();
-        if (ts == 0 || ts >= oldestLive)
-          continue;
-        rows.push_back(fileRows[i]);
-      }
+      // файл целиком старше периода — остальные ещё старее, дальше нет смысла
+      if (since && tail.back().ts < since)
+        break;
+      totalRows += (int)tail.size();
+      chunks.push_back(std::move(tail));
     }
-    std::reverse(rows.begin(), rows.end());
+    for (int i = (int)chunks.size() - 1; i >= 0; i--)
+      for (const HPoint &p : chunks[i]) {
+        if (p.ts == 0 || p.ts >= oldestLive)
+          continue;
+        if (since && p.ts < since)
+          continue;
+        rows.push_back(p);
+      }
   }
 
-  size_t total = rows.size() + live.size();
-  int    step  = (total > MAX_HISTORY_OUT) ? (int)((total + MAX_HISTORY_OUT - 1) / MAX_HISTORY_OUT) : 1;
+  // Бюджет точек: редкую историю из файлов бережём, прореживаем только
+  // плотную свежую часть из ОЗУ (иначе 12 точек старой части «съедаются»
+  // так же, как 360 свежих).
+  int liveKeep = (int)live.size();
+  int minLive  = maxOut / 3;
+  int room     = maxOut - (int)rows.size();
+  if (room < minLive)
+    room = minLive;
+  if (liveKeep > room)
+    liveKeep = room;
+  int fileBudget = maxOut - liveKeep;
+  if (fileBudget < 1)
+    fileBudget = 1;
 
-  JsonDocument doc;
-  JsonArray    arr = doc.to<JsonArray>();
-
-  int off = (total > 0) ? ((int)total - 1) % step : 0;
-  for (int i = off; i < (int)total; i += step) {
-    JsonObject o = arr.createNestedObject();
-    if (i < (int)rows.size()) {
-      const String &ln = rows[i];
-      int           p1 = ln.indexOf(',');
-      int           p2 = ln.indexOf(',', p1 + 1);
-      int           p3 = ln.indexOf(',', p2 + 1);
-      int           p4 = ln.indexOf(',', p3 + 1);
-      uint32_t ts      = (uint32_t)ln.substring(0, p1).toInt();
-      o["ts"]          = ts;
-      o["dt"]          = (ts > 1000000) ? fmtTime(ts) : ln.substring(p1 + 1, p2);
-      o["t"]           = ln.substring(p2 + 1, p3).toFloat();
-      o["h"]           = ln.substring(p3 + 1, p4).toFloat();
-      o["co2"]         = ln.substring(p4 + 1).toInt();
+  std::vector<HPoint> outv;
+  outv.reserve(maxOut);
+  if (!rows.empty()) {
+    if ((int)rows.size() <= fileBudget) {
+      outv.insert(outv.end(), rows.begin(), rows.end());
     } else {
-      const Point &p = live[i - rows.size()];
-      o["ts"]        = p.ts;
-      o["dt"]        = fmtTime(p.ts);
-      o["t"]         = p.t;
-      o["h"]         = p.h;
-      o["co2"]       = p.co2;
+      int step = (int)((rows.size() + fileBudget - 1) / fileBudget);
+      int off  = ((int)rows.size() - 1) % step;
+      for (int i = off; i < (int)rows.size(); i += step)
+        outv.push_back(rows[i]);
     }
   }
+  if (!live.empty()) {
+    int step = ((int)live.size() + liveKeep - 1) / liveKeep;
+    if (step < 1)
+      step = 1;
+    int off = ((int)live.size() - 1) % step;
+    for (int i = off; i < (int)live.size(); i += step)
+      outv.push_back(live[i]);
+  }
 
-  String out;
-  serializeJson(doc, out);
-  return out;
+  // ответ отдаём потоком: JSON целиком в памяти не собираем
+  AsyncResponseStream *resp = req->beginResponseStream("application/json");
+  resp->print('[');
+  bool firstItem = true;
+  for (const HPoint &p : outv)
+    printPoint(*resp, p, firstItem);
+  resp->print(']');
+  req->send(resp);
 }
 
 static String listLogFiles() {
@@ -458,7 +684,7 @@ main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
 #v-t{color:#f59e0b}
 #v-h{color:#38bdf8}
 #v-co2{color:#22c55e}
-#v-co2.heat{color:var(--bad);font-size:22px}   /* слово «нагрев» вместо цифр */
+#v-co2.heat{color:var(--bad);font-size:30px}   /* ♨️ вместо цифр во время прогрева */
 .marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
 .mchart{margin-top:10px}
 .prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
@@ -479,6 +705,9 @@ button.btn.warn{background:var(--warn);color:#241503}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #334155;color:var(--mut)}
 th{color:var(--txt)}
+/* Блок последних записей: прокрутка внутри блока, шапка таблицы закреплена */
+.tblwrap{max-height:46vh;overflow:auto;-webkit-overflow-scrolling:touch;border-radius:8px}
+.tblwrap thead th{position:sticky;top:0;z-index:1;background:var(--card);box-shadow:inset 0 -1px 0 #334155}
 canvas{display:block;width:100%}
 select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;border-radius:8px;max-width:100%}
 #msg{font-size:13px;color:var(--ok);min-height:18px;margin-top:8px}
@@ -505,8 +734,9 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
   <h1>🌿 Климат-монитор</h1>
   <div class="badges">
     <span class="badge" id="netBadge">—</span>
-    <span class="badge" id="timeBadge">—</span>
     <span class="badge" id="logBadge">—</span>
+    <span class="badge" id="timeBadge">—</span>
+    <span class="badge" id="upBadge">—</span>
   </div>
 </header>
 <nav>
@@ -556,9 +786,6 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
           <option value="120">5 суток</option>
           <option value="0">Вся история</option>
         </select>
-    </div>
-    <div class="prow pbtns">
-      <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
     </div>
   </div>
 </div>
@@ -618,16 +845,22 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
     <h2>Файлы логов (LittleFS)</h2>
     <div id="files" style="font-size:13px;color:var(--mut)">—</div>
     <div class="row" style="margin-top:12px">
+      <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
       <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
     </div>
   </div>
-  <div class="panel"><h2>Последние записи</h2><div style="overflow-x:auto"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
+  <div class="panel"><h2>Последние записи</h2><div class="tblwrap"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
 </div>
 
 </main>
 <script>
 let hist=[];
+let histRange=null;   
 let lastSeq=-1;  
+let timeOkFlag=true;   // true = на первой загрузке перезагрузка графиков не нужна
+let upBase=0, upAt=0;  // время работы: секунды с устройства + момент их получения
+let statsFiles=0, statsRam=0;   // записей в файлах и в ОЗУ (из /api/current)
+let statsFirst=0, statsLast=0;  // самая ранняя сохранённая и самая новая точка
 let currentTab='live';
 const $=id=>document.getElementById(id);
 
@@ -648,7 +881,7 @@ function loadUi(){
   if(u.tab) showTab(u.tab);
  }catch(e){}
 }
-function setRange(){ saveUi(); loadCharts(); }
+function setRange(){ saveUi(); loadCharts(true); }
 
 function showTab(t){currentTab=t;
 document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
@@ -672,7 +905,7 @@ function toggleChart(k){
  openCharts[k]=!openCharts[k];
  $(MET[k].box).style.display=openCharts[k]?'block':'none';
  $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
- if(openCharts[k]){drawOne(k);loadCharts();}  
+ if(openCharts[k]){drawOne(k);loadCharts(true);}  
  saveUi();
 }
 
@@ -698,12 +931,17 @@ function drawChart(id,color,label,data,yfield){
   const v=max-(max-min)*i/4; g.fillText(v.toFixed(1),4,y+4);
  }
  if(data.length){
-  const f=String(data[0].dt||'').slice(5,16), l=String(data[data.length-1].dt||'').slice(5,16);
-  g.fillText(f,pad.l,h-8);
-  g.fillText(l,w-pad.r-g.measureText(l).width,h-8);
+  // Ось X — по времени, а не по номеру точки: иначе 5-минутные точки старой
+  // части и 5-секундные свежие делят ширину поровну и период «не соблюдается».
+  const t0=Number(data[0].ts)||0, t1=Number(data[data.length-1].ts)||0;
+  const span=(t1>t0)?(t1-t0):0;
+  const X=ts=>span?(pad.l+pw*Math.max(0,Math.min(1,(Number(ts)-t0)/span))):pad.l+pw/2;
+  const fs=String(data[0].dt||'').slice(5,16), ls=String(data[data.length-1].dt||'').slice(5,16);
+  g.fillText(fs,pad.l,h-8);
+  g.fillText(ls,w-pad.r-g.measureText(ls).width,h-8);
   g.beginPath(); g.strokeStyle=color; g.lineWidth=2;
   data.forEach((d,i)=>{
-   const x=pad.l+(data.length>1?pw*i/(data.length-1):pw/2);
+   const x=(data.length>1)?X(d.ts):pad.l+pw/2;
    const y=pad.t+ph*(1-(vals[i]-min)/(max-min));
    i?g.lineTo(x,y):g.moveTo(x,y);
   });
@@ -725,7 +963,7 @@ async function pollLive(){
   const heat=!!s.heating;
   $('v-co2').classList.toggle('heat',heat);
   if(heat){
-   $('v-co2').innerHTML='нагрев';
+   $('v-co2').innerHTML='♨️';
    $('s-mhz').innerHTML='<span class="heat">идёт прогрев, '+(s.heatLeft||0)+' с</span>';
   }else{
    $('v-co2').innerHTML=s.co2;
@@ -735,32 +973,54 @@ async function pollLive(){
   $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip)+(s.mdnsOk?' · '+s.mdns:'');
   $('netBadge').title=s.mdnsOk?('Можно открывать по имени: http://'+s.mdns):'mDNS не запущен — используйте IP';
   $('timeBadge').textContent='Дата: '+s.datetime;
+  upBase=s.uptime||0; upAt=Date.now();
+  statsFiles=s.logRows||0; statsRam=s.points||0;
+  statsFirst=s.firstTs||0; statsLast=s.timestamp||0;
+  updateLogBadge();
  
-  if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(); }
+  // Часы могли появиться уже после первого запроса истории (тогда сервер отдал
+  // всю историю). Как только время известно — перечитываем строго за период.
+  if(s.timeOk&&!timeOkFlag){ timeOkFlag=true; histRange=null; loadCharts(true); }
+  else if(!s.timeOk) timeOkFlag=false;
+
+  if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(false); }
  }catch(e){}
  setTimeout(pollLive,5000);}
 
 let chartsTimer=null;
-async function loadCharts(){
+async function loadCharts(full){
  try{
-  hist=await api('/api/history?hours='+$('rangeSel').value);
-  drawAll();
-  let span='';
-  if(hist.length>1){
-   const t0=hist[0].ts, t1=hist[hist.length-1].ts;
-   const hours=Math.round((t1-t0)/3600);
-   span=hours>=24?(' · '+Math.round(hours/24)+' сут'):(' · '+hours+' ч');
+  const hours=$('rangeSel').value;
+  if(full||!hist.length||histRange!==hours){
+   // полная загрузка: при открытии, смене периода и раз в 2 минуты
+   histRange=hours;
+   hist=await api('/api/history?hours='+hours);
+  }else{
+   // живое обновление: догружаем только новые точки (лёгкий запрос)
+   const since=hist.length?hist[hist.length-1].ts:0;
+   const add=await api('/api/history?since='+since);
+   if(add&&add.length)hist=hist.concat(add);
+   // окно периода держим всегда, даже если новых точек не пришло
+   const hrs=parseFloat(hours)||0;
+   const last=hist.length?Number(hist[hist.length-1].ts)||0:0;
+   if(hrs>0&&last>0){
+    const cut=last-hrs*3600;
+    hist=hist.filter(d=>Number(d.ts)>=cut);
+   }
+   const cap=hrs>0?600:1500;
+   if(hist.length>cap)hist=hist.slice(hist.length-cap);
   }
-  $('logBadge').textContent='Точек: '+hist.length+span;
+  drawAll();
+  updateLogBadge();
  }catch(e){}}
 
-function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(loadCharts,120000); }
+function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(()=>loadCharts(true),120000); }
 
 async function loadData(){
  try{
   const files=await api('/api/files');
   $('files').innerHTML=files.length?('Файлов: '+files.length+'<br>'+files.join('<br>')):'Нет файлов';
-  const h=await api('/api/history?points=50');
+  const h=await api('/api/history?points=200');
   const tb=$('tbl').querySelector('tbody');tb.innerHTML='';
   h.slice().reverse().forEach(d=>{tb.insertAdjacentHTML('beforeend',
    `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`);});
@@ -782,7 +1042,7 @@ async function calibrate(cmd){
 
 async function loadStatus(){
  try{const s=await api('/api/sensor');
-  $('calstat').innerHTML=`Диапазон: ${s.range} ppm · ABC: ${s.abc===1||s.abc===true?'вкл':'выкл'} · CO₂ сейчас: ${s.heating?'нагрев':s.co2+' ppm'} · Связь: ${s.heating?'прогрев':(s.mhzOk?'OK':'нет данных')}`;
+  $('calstat').innerHTML=`Диапазон: ${s.range} ppm · ABC: ${s.abc===1||s.abc===true?'вкл':'выкл'} · CO₂ сейчас: ${s.heating?'♨️':s.co2+' ppm'} · Связь: ${s.heating?'прогрев':(s.mhzOk?'OK':'нет данных')}`;
  }catch(e){$('calstat').textContent='Ошибка запроса';}}
 
 async function clearLogs(){
@@ -800,14 +1060,43 @@ async function loadSettings(){
 async function saveSettings(){
  const b=new URLSearchParams({pointSec:$('setPointSec').value,saveMin:$('setSaveMin').value});
  const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
- $('setmsg').textContent=await r.text(); loadCharts();}
+ $('setmsg').textContent=await r.text(); loadCharts(true);}
 
 function exportCsv(){location.href='/api/export';}
+
+// Время работы с момента включения: показываем посекундно, раз в 5 с
+// синхронизируем с устройством (иначе секунды прыгали бы по 5).
+function fmtUptime(t){
+ t=Math.max(0,Math.floor(t));
+ const d=Math.floor(t/86400), h=Math.floor(t%86400/3600), m=Math.floor(t%3600/60), s=t%60;
+ const p=n=>String(n).padStart(2,'0');
+ return (d>0?d+' д ':'')+p(h)+':'+p(m)+':'+p(s);
+}
+function tickUptime(){
+ if(!upAt)return;
+ $('upBadge').textContent='Время работы: '+fmtUptime(upBase+Math.floor((Date.now()-upAt)/1000));
+}
+
+// Бейдж показывает, сколько измерений всего сохранено (файлы + ОЗУ), и период
+// от самой ранней сохранённой точки до самой новой — а не окно графика.
+function logSpan(){
+ const t0=Number(statsFirst)||0, t1=Number(statsLast)||0;
+ if(!t0||!t1||t1<=t0)return '';
+ const sec=t1-t0;
+ if(sec<3600)return ' · '+Math.max(1,Math.round(sec/60))+' мин';
+ const h=sec/3600;
+ return h>=24?(' · '+Math.round(h/24)+' сут'):(' · '+Math.round(h)+' ч');
+}
+function updateLogBadge(){
+ $('logBadge').textContent='Записей: '+(statsFiles+statsRam)+logSpan();
+ $('logBadge').title='В файлах: '+statsFiles+' · в ОЗУ: '+statsRam+' · на графике: '+hist.length;
+}
 window.addEventListener('resize',drawAll);
 loadUi();
 pollLive();
-loadCharts();
+loadCharts(true);
 startChartsLive();
+setInterval(tickUptime,1000);
 </script>
 </body>
 </html>)rawliteral";
@@ -822,22 +1111,33 @@ static void setupWeb() {
   });
 
   server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *req) {
-    int points = 720;
-    if (req->hasParam("hours")) {
-      int hours = req->getParam("hours")->value().toInt();
-      if (hours <= 0) {
-        points = 20000;
-      } else {
-        uint32_t sec = (uint32_t)hours * 3600UL;
-        points       = (int)(sec / (pointIntervalMs / 1000UL));
-        if (points < 10)
-          points = 10;
-      }
-    } else if (req->hasParam("points")) {
-      points = req->getParam("points")->value().toInt();
+    // ?since=<ts> — только новые точки (живое обновление графиков, ответ крошечный)
+    if (req->hasParam("since")) {
+      uint32_t since = (uint32_t)strtoul(req->getParam("since")->value().c_str(), nullptr, 10);
+      req->send(200, "application/json", jsonHistorySince(since));
+      return;
     }
-    points = constrain(points, 10, 20000);
-    req->send(200, "application/json", jsonHistory(points));
+
+    // ?points=N — N последних точек (таблица «Последние записи»)
+    if (req->hasParam("points")) {
+      int pts = (int)req->getParam("points")->value().toInt();
+      pts     = constrain(pts, 10, 20000);
+      sendHistory(req, 0, pts);
+      return;
+    }
+
+    // ?hours=N — строго за последние N часов (0 = вся история)
+    int hours = 12;
+    if (req->hasParam("hours"))
+      hours = req->getParam("hours")->value().toInt();
+    uint32_t since = 0;
+    // Ориентируемся на само время, а не на флаг timeSynced: после перезагрузки
+    // оно может быть уже верным (RTC), а флаг поднимется только на NTP-проверке.
+    if (hours > 0 && time(nullptr) > 1000000)
+      since = (uint32_t)time(nullptr) - (uint32_t)hours * 3600UL;
+    Serial.printf("[MEM] /api/history: период %d ч (since=%lu), heap=%u\n",
+                  hours, (unsigned long)since, (unsigned)ESP.getFreeHeap());
+    sendHistory(req, since, 0);
   });
 
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -967,6 +1267,8 @@ static void setupWeb() {
     listFiles(LOGS_DIR, names);
     for (auto &n : names)
       LittleFS.remove(n);
+    logRowsTotal = 0;
+    oldestSavedTs = 0;
     req->send(200, "text/plain", "Логи удалены");
   });
 
@@ -1064,6 +1366,17 @@ void setup() {
   delay(300);
   Serial.println("\n=== Climat Monitor ===");
 
+  // Часы ESP32 (RTC) держат время между перезагрузками, а при прошивке питание
+  // не снимается — значит до NTP время уже верное. Без этого первый запрос
+  // истории уходил с since=0 и графики строились «за всё время».
+  {
+    time_t rtcNow = time(nullptr);
+    if (rtcNow > 1000000) {
+      timeSynced = true;
+      Serial.printf("[NTP] время уже есть (RTC): %lu\n", (unsigned long)rtcNow);
+    }
+  }
+
   prefs.begin("cfg", false);
 
   {
@@ -1082,6 +1395,8 @@ void setup() {
   }
   if (!LittleFS.exists(LOGS_DIR))
     LittleFS.mkdir(LOGS_DIR);
+
+  recountLogRows();   // сколько записей уже лежит в файлах (один раз на старте)
 
   dht.begin();
 

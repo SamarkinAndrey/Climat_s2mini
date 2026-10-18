@@ -616,7 +616,23 @@
       if (t === 'data') { loadData(); loadSettings(); } if (t === 'calib') loadStatus();
       if (t === 'live') drawAll();
       saveUi();
+      navScrollToActive(!!dir);
     }
+
+    // Активная вкладка в шапке должна быть видна целиком — доводим шапку до неё.
+    // При свайпе/клике плавно, при загрузке страницы мгновенно.
+    function navScrollToActive(smooth) {
+      const nav = document.querySelector('nav');
+      const btn = nav && nav.querySelector('button.active');
+      if (!nav || !btn) return;
+      const n = nav.getBoundingClientRect(), b = btn.getBoundingClientRect();
+      const max = nav.scrollWidth - nav.clientWidth;
+      const delta = (b.left - n.left) - (n.width - b.width) / 2;
+      const x = Math.max(0, Math.min(max, nav.scrollLeft + delta));
+      try { nav.scrollTo({ left: x, behavior: smooth ? 'smooth' : 'auto' }); }
+      catch (e) { nav.scrollLeft = x; }
+    }
+    window.addEventListener('resize', () => navScrollToActive(false));
 
     // Свайп влево/вправо переключает вкладки. Навигацию (шапку) не трогаем —
     // её горизонтальный скролл должен работать как обычно.

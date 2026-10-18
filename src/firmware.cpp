@@ -71,13 +71,16 @@ static SemaphoreHandle_t fsMutex  = nullptr;
 static bool mhzLock(uint32_t ms = 1000) {
   return mhzMutex && xSemaphoreTake(mhzMutex, pdMS_TO_TICKS(ms)) == pdTRUE;
 }
+
 static void mhzUnlock() {
   if (mhzMutex)
     xSemaphoreGive(mhzMutex);
 }
+
 static bool fsLock(uint32_t ms = 2000) {
   return fsMutex && xSemaphoreTake(fsMutex, pdMS_TO_TICKS(ms)) == pdTRUE;
 }
+
 static void fsUnlock() {
   if (fsMutex)
     xSemaphoreGive(fsMutex);
@@ -92,10 +95,10 @@ struct Reading {
 
 Reading  latest;
 bool     dhtOk = false, mhzOk = false;
-bool     mhzHeating      = true;   // идёт преднагрев MH-Z19
-bool     mdnsStarted     = false;  // mDNS запущен (http://climat.local)
-bool     mdnsRestart     = false;  // сеть переподключилась — mDNS надо перерегистрировать
-uint32_t heatingStartMs  = 0;      // момент старта датчика (для отсчёта прогрева)
+bool     mhzHeating      = true;  // идёт преднагрев MH-Z19
+bool     mdnsStarted     = false; // mDNS запущен (http://climat.local)
+bool     mdnsRestart     = false; // сеть переподключилась — mDNS надо перерегистрировать
+uint32_t heatingStartMs  = 0;     // момент старта датчика (для отсчёта прогрева)
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
 uint32_t lastPointMs     = 0;
@@ -117,13 +120,13 @@ struct Point {
   uint16_t co2;
 };
 
-Point liveBuf[MAX_LIVE_POINTS];
-int   liveHead  = 0;
-int   liveCount = 0;
+Point               liveBuf[MAX_LIVE_POINTS];
+int                 liveHead  = 0;
+int                 liveCount = 0;
 // Кольцо ОЗУ читают и loop-задача, и обработчики веб-сервера (другая задача).
 // Точку пишем и читаем целиком под короткой критической секцией — иначе
 // возможна «рваная» точка (новый ts со старыми значениями).
-static portMUX_TYPE liveMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE liveMux   = portMUX_INITIALIZER_UNLOCKED;
 
 String cfgSsid, cfgPass;
 int    mhzRange = 5000;
@@ -202,8 +205,8 @@ static uint32_t countFileRows(const String &path) {
   if (!lines)
     return 0;
   if (last != '\n')
-    lines++;           // файл без перевода строки в конце
-  return lines - 1;    // минус строка-заголовок
+    lines++;        // файл без перевода строки в конце
+  return lines - 1; // минус строка-заголовок
 }
 
 // Unix-время первой (самой ранней) записи в файле — нужна для бейджа
@@ -212,7 +215,7 @@ static uint32_t firstFileTs(const String &path) {
   File f = LittleFS.open(path, "r");
   if (!f)
     return 0;
-  f.readStringUntil('\n');              // заголовок
+  f.readStringUntil('\n');               // заголовок
   String line = f.readStringUntil('\n'); // первая строка данных
   f.close();
   int comma = line.indexOf(',');
@@ -236,7 +239,7 @@ static void recountLogRows() {
     int oi = 0;
     for (size_t i = 1; i < names.size(); i++)
       if (names[i] < names[oi])
-        oi = i;                          // файлы названы по дате, свежие — в конце
+        oi = i; // файлы названы по дате, свежие — в конце
     oldestSavedTs = firstFileTs(names[oi]);
   }
   Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
@@ -263,7 +266,7 @@ static void rotateLogsIfNeeded() {
     logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
-    removed++;   // без этого условия removed < 2 не работало
+    removed++; // без этого условия removed < 2 не работало
     // самая ранняя запись теперь в самом старом из оставшихся файлов
     oldestSavedTs = 0;
     if (!names.empty()) {
@@ -347,22 +350,26 @@ static Point liveGet(int idx) {
 // в другой задаче. Все обращения — под короткой критической секцией, иначе
 // возможна «рваная» тройка t/h/co2 из разных измерений.
 static portMUX_TYPE latestMux = portMUX_INITIALIZER_UNLOCKED;
+
 static void setLatestTh(float t, float h) {
   portENTER_CRITICAL(&latestMux);
   latest.temperature = t;
   latest.humidity    = h;
   portEXIT_CRITICAL(&latestMux);
 }
+
 static void setLatestCo2(uint16_t c) {
   portENTER_CRITICAL(&latestMux);
   latest.co2 = c;
   portEXIT_CRITICAL(&latestMux);
 }
+
 static void setLatestTs(uint32_t ts) {
   portENTER_CRITICAL(&latestMux);
   latest.timestamp = ts;
   portEXIT_CRITICAL(&latestMux);
 }
+
 static Reading getLatest() {
   Reading r;
   portENTER_CRITICAL(&latestMux);
@@ -395,7 +402,7 @@ static void readSensors() {
   mhzHeating      = (uptime < MHZ19_HEATING_TIME);
   if (mhzHeating) {
     static uint32_t lastHeatLog = 0xFFFFFFFFUL;
-    if (uptime / 30000UL != lastHeatLog) {   // отмечаемся в мониторе раз в 30 с
+    if (uptime / 30000UL != lastHeatLog) { // отмечаемся в мониторе раз в 30 с
       lastHeatLog = uptime / 30000UL;
       Serial.printf("[MHZ] прогрев: %lu/%lu с — показания не пишутся\n",
                     uptime / 1000UL, MHZ19_HEATING_TIME / 1000UL);
@@ -460,7 +467,7 @@ static void tryNtp() {
 
   if (now - lastNtpTry < 10000)
     return;
-  lastNtpTry = now;
+  lastNtpTry                 = now;
   // configTime() каждый раз создаёт новый SNTP-контекст/задачу — при
   // вызовах каждые 10 с это утечка heap и лишняя нагрузка на Wi-Fi стек.
   // Настраиваем синхронизацию один раз, дальше только читаем время.
@@ -478,7 +485,7 @@ static void tryNtp() {
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     setLatestTs((uint32_t)tt);
-    if (!mhzHeating) {            // во время прогрева точки не создаём
+    if (!mhzHeating) { // во время прогрева точки не создаём
       logReading(latest);
       pushLivePoint(latest);
     }
@@ -502,7 +509,7 @@ static uint64_t uptimeMsTotal() {
 // обработчик самый горячий, его опрашивает каждый клиент раз в 5 с).
 static size_t jsonCurrent(char *buf, size_t n) {
   JsonDocument doc;
-  Reading r = getLatest();          // атомарный снимок показаний
+  Reading      r     = getLatest(); // атомарный снимок показаний
   doc["temperature"] = r.temperature;
   doc["humidity"]    = r.humidity;
   doc["co2"]         = r.co2;
@@ -510,8 +517,8 @@ static size_t jsonCurrent(char *buf, size_t n) {
   doc["mhzOk"]       = mhzOk;
   doc["heating"]     = mhzHeating;
   doc["heatLeft"]    = mhzHeating
-                         ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
-                         : 0;
+                           ? (int)((MHZ19_HEATING_TIME - (millis() - heatingStartMs)) / 1000UL)
+                           : 0;
   doc["timestamp"]   = r.timestamp;
   bool timeOk        = (time(nullptr) > 1000000);
   doc["timeOk"]      = timeOk;
@@ -520,11 +527,11 @@ static size_t jsonCurrent(char *buf, size_t n) {
   } else {
     doc["datetime"] = "NTP ожидание...";
   }
-  doc["uptime"]       = (uint32_t)(uptimeMsTotal() / 1000);
-  doc["mode"]         = apMode ? "AP" : "STA";
-  doc["ip"]           = WiFi.localIP().toString();
-  doc["mdns"]         = String(MDNS_HOST) + ".local";
-  doc["mdnsOk"]       = mdnsStarted;
+  doc["uptime"]   = (uint32_t)(uptimeMsTotal() / 1000);
+  doc["mode"]     = apMode ? "AP" : "STA";
+  doc["ip"]       = WiFi.localIP().toString();
+  doc["mdns"]     = String(MDNS_HOST) + ".local";
+  doc["mdnsOk"]   = mdnsStarted;
   // Разность millis() (беззнаковая) переживает переполнение счётчика,
   // в отличие от lastLogMs + saveIntervalMs.
   uint32_t nextIn = 0;
@@ -540,7 +547,7 @@ static size_t jsonCurrent(char *buf, size_t n) {
   liveSnapshot(lvHead, lvCount);
   doc["points"] = lvCount;
 
-  doc["logRows"] = logRowsTotal;   // всего записей в файлах
+  doc["logRows"]   = logRowsTotal; // всего записей в файлах
   // Самая ранняя из сохранённых точек: файлы (если есть) либо начало ОЗУ.
   uint32_t firstTs = oldestSavedTs;
   if (lvCount) {
@@ -548,8 +555,8 @@ static size_t jsonCurrent(char *buf, size_t n) {
     if (ramFirst && (!firstTs || ramFirst < firstTs))
       firstTs = ramFirst;
   }
-  doc["firstTs"]      = firstTs;
-  doc["pointsSeq"]    = pointsSeq;
+  doc["firstTs"]   = firstTs;
+  doc["pointsSeq"] = pointsSeq;
   return serializeJson(doc, buf, n);
 }
 
@@ -576,7 +583,7 @@ static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &o
   int                 cnt = 0, head = 0;
   // Разбор строки без String/substring — на больших файлах это сотни
   // временных аллокаций за вызов и заметная фрагментация кучи.
-  char line[128];
+  char                line[128];
   while (f.available()) {
     size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
     if (n == 0)
@@ -584,10 +591,10 @@ static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &o
     line[n] = 0;
     if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
       continue;
-    char *c1 = strchr(line, ',');       // после ts
+    char *c1 = strchr(line, ',');   // после ts
     if (!c1)
       continue;
-    char *c2 = strchr(c1 + 1, ',');     // после datetime
+    char *c2 = strchr(c1 + 1, ','); // после datetime
     if (!c2)
       continue;
     char *c3 = strchr(c2 + 1, ',');
@@ -677,7 +684,7 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
   liveSnapshot(lh, lc);
   int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
 
-  int      firstPass  = 0;             // смещение первой точки, прошедшей фильтр
+  int      firstPass  = 0; // смещение первой точки, прошедшей фильтр
   uint32_t oldestLive = 0xFFFFFFFFu;
   while (firstPass < lc) {
     uint32_t ts = liveGet((start + firstPass) % MAX_LIVE_POINTS).ts;
@@ -687,7 +694,7 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
     }
     firstPass++;
   }
-  int liveAfter = lc - firstPass;
+  int      liveAfter  = lc - firstPass;
   // Последняя точка на момент снимка. Пока читаем файлы, loop может успеть
   // записать новую точку и затереть самый старый слот кольца; выборку из ОЗУ
   // делаем после файлов, поэтому отсекаем «чужие» ts по этому ориентиру —
@@ -710,7 +717,7 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
   if (need < 0)
     need = 0;
   if (need > MAX_FILE_ROWS)
-    need = MAX_FILE_ROWS;   // страховка: сколько бы точек ни просили, не больше лимита
+    need = MAX_FILE_ROWS; // страховка: сколько бы точек ни просили, не больше лимита
 
   // --- точки из файлов (только хвосты, файл целиком не читаем) ---
   std::vector<HPoint> rows;
@@ -725,7 +732,7 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
     for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < need; fi--) {
       int perFile = need - (int)rows.size();
       if (perFile > 600)
-        perFile = 600;   // кольцо на файл ограничиваем, чтобы не раздувать heap
+        perFile = 600; // кольцо на файл ограничиваем, чтобы не раздувать heap
       std::vector<HPoint> tail;
       readFileTail(names[fi], perFile, tail);
       if (tail.empty())
@@ -782,7 +789,7 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
     for (int k = off; k < liveAfter; k += step) {
       Point sp = liveGet((start + firstPass + k) % MAX_LIVE_POINTS);
       if (sp.ts == 0 || sp.ts < oldestLive || sp.ts > liveNewest)
-        continue;   // слот успел перезаписаться во время чтения файлов
+        continue; // слот успел перезаписаться во время чтения файлов
       outv.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
     }
   }
@@ -821,10 +828,10 @@ static String listLogFiles() {
 // Страница веб-интерфейса лежит отдельным файлом src/index.html и вшивается
 // в прошивку на этапе сборки (platformio.ini: board_build.embed_files).
 // Отдаём её из flash потоково (AsyncProgmemResponse) — копии в куче нет.
-extern const uint8_t index_html_start[] asm("_binary_src_index_html_start");
-extern const uint8_t index_html_end[]   asm("_binary_src_index_html_end");
-static const uint8_t *const INDEX_HTML    = index_html_start;
-static const size_t        INDEX_HTML_LEN = (size_t)(index_html_end - index_html_start);
+extern const uint8_t        index_html_start[] asm("_binary_src_index_html_start");
+extern const uint8_t        index_html_end[] asm("_binary_src_index_html_end");
+static const uint8_t *const INDEX_HTML     = index_html_start;
+static const size_t         INDEX_HTML_LEN = (size_t)(index_html_end - index_html_start);
 
 // --- Выгрузка логов в CSV (chunked) ---
 // AsyncResponseStream хранит весь ответ в String (StreamString): на экспорте в
@@ -833,10 +840,10 @@ static const size_t        INDEX_HTML_LEN = (size_t)(index_html_end - index_html
 // только одну строку. Файлы открываем без удержания мьютекса между вызовами.
 struct ExportCtx {
   std::vector<String> names;
-  size_t              idx       = 0;
+  size_t              idx = 0;
   File                f;
-  size_t              headerPos = 0;   // сколько байт заголовка CSV уже отдано
-  char                pending[168];    // хвост строки, не влезший в буфер
+  size_t              headerPos = 0; // сколько байт заголовка CSV уже отдано
+  char                pending[168];  // хвост строки, не влезший в буфер
   size_t              pendingLen = 0;
 };
 
@@ -845,11 +852,22 @@ static bool exportNextLine(ExportCtx &c, char *line, size_t n) {
   while (c.idx < c.names.size()) {
     if (!c.f) {
       c.f = LittleFS.open(c.names[c.idx], "r");
-      if (!c.f) { c.idx++; continue; }
+      if (!c.f) {
+        c.idx++;
+        continue;
+      }
     }
-    if (!c.f.available()) { c.f.close(); c.idx++; continue; }
+    if (!c.f.available()) {
+      c.f.close();
+      c.idx++;
+      continue;
+    }
     size_t ln = c.f.readBytesUntil('\n', line, n - 1);
-    if (ln == 0) { c.f.close(); c.idx++; continue; }
+    if (ln == 0) {
+      c.f.close();
+      c.idx++;
+      continue;
+    }
     line[ln] = 0;
     if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
       continue;
@@ -862,8 +880,8 @@ static bool exportNextLine(ExportCtx &c, char *line, size_t n) {
 // пишет хотя бы байт, если данные ещё есть, иначе библиотека сочтёт ответ
 // законченным. Возврат 0 = всё отдано.
 static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
-  ExportCtx *c   = (ExportCtx *)ctx;
-  size_t     out = 0;
+  ExportCtx        *c   = (ExportCtx *)ctx;
+  size_t            out = 0;
   static const char H[] = "timestamp,datetime,temperature,humidity,co2\n";
   const size_t      HL  = sizeof(H) - 1;
 
@@ -875,7 +893,7 @@ static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
       return RESPONSE_TRY_AGAIN;
     char peek[160];
     if (!exportNextLine(*c, peek, sizeof(peek)))
-      return 0;                        // данных больше нет — ответ завершён
+      return 0; // данных больше нет — ответ завершён
     size_t pn = strlen(peek);
     memcpy(c->pending, peek, pn);
     c->pending[pn] = '\n';
@@ -883,11 +901,11 @@ static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
     return RESPONSE_TRY_AGAIN;
   }
 
-  bool locked = fsLock(2000);      // держим только на время чтения строк
+  bool locked = fsLock(2000); // держим только на время чтения строк
   char line[160];
 
   while (out < maxLen) {
-    if (c->headerPos < HL) {       // заголовок CSV (может не влезть целиком)
+    if (c->headerPos < HL) { // заголовок CSV (может не влезть целиком)
       size_t take = HL - c->headerPos;
       if (take > maxLen - out)
         take = maxLen - out;
@@ -896,7 +914,7 @@ static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
       c->headerPos += take;
       continue;
     }
-    if (c->pendingLen) {           // хвост предыдущей строки
+    if (c->pendingLen) { // хвост предыдущей строки
       size_t take = c->pendingLen;
       if (take > maxLen - out)
         take = maxLen - out;
@@ -905,20 +923,20 @@ static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
       if (take < c->pendingLen) {
         memmove(c->pending, c->pending + take, c->pendingLen - take);
         c->pendingLen -= take;
-        break;                     // буфер заполнен
+        break; // буфер заполнен
       }
       c->pendingLen = 0;
       continue;
     }
     if (!exportNextLine(*c, line, sizeof(line)))
-      break;                       // строки кончились — ответ завершён
-    size_t ll = strlen(line);
+      break; // строки кончились — ответ завершён
+    size_t ll   = strlen(line);
     size_t take = ll;
     if (take > maxLen - out)
       take = maxLen - out;
     memcpy(buf + out, line, take);
     out += take;
-    if (take < ll) {               // вся строка не влезла — хвост придержим
+    if (take < ll) { // вся строка не влезла — хвост придержим
       memcpy(c->pending, line + take, ll - take);
       c->pending[ll - take] = '\n';
       c->pendingLen         = ll - take + 1;
@@ -963,7 +981,7 @@ static void setupWeb() {
       // Верхнюю границу держим небольшой: AsyncResponseStream копит весь ответ
       // в String, и большое N — это десятки КБ на куче впустую. Таблице нужно
       // 50 точек, полную историю графики запрашивают отдельно (?hours).
-      pts = constrain(pts, 10, MAX_HISTORY_OUT);
+      pts     = constrain(pts, 10, MAX_HISTORY_OUT);
       sendHistory(req, 0, pts);
       return;
     }
@@ -1101,7 +1119,7 @@ static void setupWeb() {
   });
 
   server.on("/api/sensor", HTTP_GET, [](AsyncWebServerRequest *req) {
-    int  range = mhzRange;                       // если датчик занят — кэш с запуска
+    int  range = mhzRange; // если датчик занят — кэш с запуска
     bool abc   = prefs.getBool("abc", true);
     if (mhzLock()) {
       range = mhz.getRange();
@@ -1109,10 +1127,10 @@ static void setupWeb() {
       mhzUnlock();
     }
     JsonDocument doc;
-    doc["range"] = range;
-    doc["abc"]   = abc;
-    doc["co2"]   = getLatest().co2;
-    doc["mhzOk"] = mhzOk;
+    doc["range"]   = range;
+    doc["abc"]     = abc;
+    doc["co2"]     = getLatest().co2;
+    doc["mhzOk"]   = mhzOk;
     doc["heating"] = mhzHeating;
     char out[192];
     serializeJson(doc, out, sizeof(out));
@@ -1133,7 +1151,7 @@ static void setupWeb() {
       for (size_t j = i + 1; j < names.size(); j++)
         if (names[j] < names[i])
           std::swap(names[i], names[j]);
-    const int perPass = 2;                 // сколько файлов стираем за один запрос
+    const int perPass = 2; // сколько файлов стираем за один запрос
     int       removed = 0;
     for (auto &n : names) {
       if (removed >= perPass)
@@ -1162,7 +1180,7 @@ static void setupWeb() {
 // ВАЖНО: в этом ядре ESPmDNS не подписывается на события сети (подписка
 // закомментирована в ESPmDNS.cpp), поэтому если Wi-Fi поднялся ПОСЛЕ старта,
 // или произошёл реконнект — mDNS нужно перезапустить вручную (mdnsRestart).
-static uint32_t lastMdnsStaIp = 0;   // STA-адрес, для которого mDNS уже зарегистрирован
+static uint32_t lastMdnsStaIp = 0; // STA-адрес, для которого mDNS уже зарегистрирован
 
 static void startMdns() {
   if (mdnsStarted && !mdnsRestart)
@@ -1182,7 +1200,7 @@ static void startMdns() {
         lastMdnsStaIp != 0 && (uint32_t)WiFi.localIP() == lastMdnsStaIp)
       return;
     if (mdnsStarted) {
-      MDNS.end();            // перерегистрируемся на новом интерфейсе
+      MDNS.end(); // перерегистрируемся на новом интерфейсе
       mdnsStarted = false;
     }
   }
@@ -1196,8 +1214,8 @@ static void startMdns() {
   }
   MDNS.setInstanceName("Climat Monitor");
   MDNS.addService("http", "tcp", 80);
-  mdnsStarted    = true;
-  lastMdnsStaIp  = (WiFi.status() == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
+  mdnsStarted   = true;
+  lastMdnsStaIp = (WiFi.status() == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
   Serial.printf("[MDNS] открыть: http://%s.local (%s, IP %s)\n", MDNS_HOST,
                 apMode ? "AP" : "STA",
                 apMode ? WiFi.softAPIP().toString().c_str()
@@ -1219,14 +1237,14 @@ static void setupNetwork() {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
       Serial.printf("[NET] STA подключено, IP: %s\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
-      mdnsRestart = true;   // интерфейс поднялся — перерегистрируем mDNS
+      mdnsRestart = true; // интерфейс поднялся — перерегистрируем mDNS
     }
   });
 
   if (cfgSsid.length()) {
     Serial.println("[NET] Пробую подключиться к: " + cfgSsid);
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setHostname(MDNS_HOST);   // имя в DHCP: роутеры с локальным DNS дадут climat
+    WiFi.setHostname(MDNS_HOST); // имя в DHCP: роутеры с локальным DNS дадут climat
     WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     uint32_t t0 = millis();
@@ -1283,12 +1301,12 @@ void setup() {
   if (!LittleFS.exists(LOGS_DIR))
     LittleFS.mkdir(LOGS_DIR);
 
-  recountLogRows();   // сколько записей уже лежит в файлах (один раз на старте)
+  recountLogRows(); // сколько записей уже лежит в файлах (один раз на старте)
 
   dht.begin();
 
   mhzSerial.begin(9600, SERIAL_8N1, MHZ_RX, MHZ_TX);
-  heatingStartMs = millis();             // с этого момента считаем преднагрев
+  heatingStartMs = millis(); // с этого момента считаем преднагрев
   mhz.begin(mhzSerial);
   mhz.setFilter(true, false);
   mhz.setRange(5000);
@@ -1305,8 +1323,8 @@ void setup() {
 
   readSensors();
   setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
-  lastLogMs        = millis();
-  lastPointMs      = millis();
+  lastLogMs   = millis();
+  lastPointMs = millis();
   Serial.printf("[INIT] точка каждые %lu с, сохранение в файл каждые %lu мин\n",
                 pointIntervalMs / 1000, saveIntervalMs / 60000);
   Serial.println("[INIT] готово");
@@ -1316,7 +1334,7 @@ void loop() {
   if (dnsStarted)
     dnsServer.processNextRequest();
 
-  startMdns();   // если Wi-Fi подключился позже — поднимем mDNS
+  startMdns(); // если Wi-Fi подключился позже — поднимем mDNS
   static uint32_t lastRead = 0;
   if (millis() - lastRead > 5000) {
     lastRead = millis();
@@ -1325,14 +1343,14 @@ void loop() {
   }
 
   if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
-    lastPointMs      = millis();
+    lastPointMs = millis();
     setLatestTs((uint32_t)time(nullptr));
     if ((dhtOk || mhzOk) && !mhzHeating)
       pushLivePoint(latest);
   }
 
   if (millis() - lastLogMs >= saveIntervalMs) {
-    lastLogMs        = millis();
+    lastLogMs = millis();
     setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
     if ((dhtOk || mhzOk) && !mhzHeating)
       logReading(latest);

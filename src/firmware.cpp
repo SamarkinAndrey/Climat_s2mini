@@ -138,7 +138,12 @@ static void rotateLogsIfNeeded() {
   std::vector<String> names;
   listFiles(LOGS_DIR, names);
 
-  while (names.size() > MAX_LOG_FILES) {
+  // Удаление файлов из LittleFS блокирует loop-задачу на десятки миллисекунд
+  // и вызывает пиковое потребление по 3V3. Ограничиваем число удалений за
+  // один проход, чтобы редкая ротация не совпадала по времени с записью
+  // точки и Wi-Fi-запросами (подозрение на brownout-перезагрузки).
+  int removed = 0;
+  while (names.size() > MAX_LOG_FILES && removed < 2) {
     int oldestIdx = 0;
     for (size_t i = 1; i < names.size(); i++)
       if (names[i] < names[oldestIdx])
@@ -146,6 +151,7 @@ static void rotateLogsIfNeeded() {
     Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
     LittleFS.remove(names[oldestIdx]);
     names.erase(names.begin() + oldestIdx);
+    removed++;
   }
 }
 
@@ -261,7 +267,14 @@ static void tryNtp() {
   if (now - lastNtpTry < 10000)
     return;
   lastNtpTry = now;
-  configTime(3 * 3600, 0, NTP_SERVER);
+  // configTime() каждый раз создаёт новый SNTP-контекст/задачу — при
+  // вызовах каждые 10 с это утечка heap и лишняя нагрузка на Wi-Fi стек.
+  // Настраиваем синхронизацию один раз, дальше только читаем время.
+  static bool sntpConfigured = false;
+  if (!sntpConfigured) {
+    configTime(3 * 3600, 0, NTP_SERVER);
+    sntpConfigured = true;
+  }
   time_t tt = time(nullptr);
   if (tt > 1000000 && !timeSynced) {
     timeSynced = true;
@@ -621,7 +634,7 @@ select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;
       <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
     </div>
   </div>
-  <div class="panel"><h2>Последние записи</h2><div style="overflow-x:auto"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
+  <div class="panel"><h2>Последние записи</h2><div id="tblWrap" style="overflow:auto;max-height:420px"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
 </div>
 
 </main>
@@ -760,10 +773,13 @@ async function loadData(){
  try{
   const files=await api('/api/files');
   $('files').innerHTML=files.length?('Файлов: '+files.length+'<br>'+files.join('<br>')):'Нет файлов';
-  const h=await api('/api/history?points=50');
+  const h=await api('/api/history?points=400');
   const tb=$('tbl').querySelector('tbody');tb.innerHTML='';
-  h.slice().reverse().forEach(d=>{tb.insertAdjacentHTML('beforeend',
-   `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`);});
+  const rows=h.slice(-50).reverse();
+  let html='';
+  rows.forEach(d=>{html+=`<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`;});
+  tb.innerHTML=html;
+  $('files').innerHTML+='<br><span style="color:var(--mut)">Показаны последние 50 из '+h.length+' запрошенных точек. Полные данные — в графиках и CSV.</span>';
  }catch(e){}}
 
 async function saveWifi(){
@@ -1059,10 +1075,28 @@ static void setupNetwork() {
   }
 }
 
+// Диагностика перезагрузок: печатаем причину последнего сброса и свободную
+// память. ESP_RST_BROWNOUT = просадка 3V3 при пике тока (запись flash +
+// Wi-Fi + преднагрев MH-Z19) — главный кандидат при «перезагрузках каждые
+// 5 минут». freeHeap по boot'ам показывает возможные утечки памяти.
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== Climat Monitor ===");
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.printf("[BOOT] причина перезагрузки: %d (%s), freeHeap=%u\n",
+                (int)rr,
+                rr == ESP_RST_POWERON ? "POWERON" :
+                rr == ESP_RST_EXT ? "EXT (RST/прошивка)" :
+                rr == ESP_RST_SW ? "SW (ESP.restart)" :
+                rr == ESP_RST_PANIC ? "PANIC (исключение)" :
+                rr == ESP_RST_INT_WDT ? "INT_WDT" :
+                rr == ESP_RST_TASK_WDT ? "TASK_WDT" :
+                rr == ESP_RST_WDT ? "WDT (другой)" :
+                rr == ESP_RST_DEEPSLEEP ? "DEEPSLEEP" :
+                rr == ESP_RST_BROWNOUT ? "BROWNOUT (просадка питания!)" :
+                rr == ESP_RST_SDIO ? "SDIO" : "UNKNOWN",
+                ESP.getFreeHeap());
 
   prefs.begin("cfg", false);
 

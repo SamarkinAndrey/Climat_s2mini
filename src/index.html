@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Climat Monitor</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--mut:#94a3b8;--acc:#38bdf8;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{overflow-x:hidden}
+body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
+header{padding:10px 12px;background:var(--card);display:flex;flex-direction:column;gap:8px;width:100%}
+header h1{font-size:24px;font-weight:600;line-height:1.2}
+.badges{display:flex;gap:8px;flex-wrap:wrap;min-width:0}
+.badge{font-size:12px;padding:3px 10px;border-radius:999px;background:#334155;color:var(--mut);white-space:nowrap}
+nav{display:flex;gap:4px;padding:6px 10px;background:var(--card);border-bottom:1px solid #334155;overflow-x:auto;scrollbar-width:none;width:100%}
+nav::-webkit-scrollbar{display:none}
+nav button{background:none;border:none;color:var(--mut);padding:8px 12px;cursor:pointer;font-size:13px;border-radius:8px;white-space:nowrap;flex:0 0 auto}
+nav button.active{background:var(--acc);color:#04263a;font-weight:600}
+main{padding:12px;max-width:1100px;margin:0 auto;width:100%}
+.tab{display:none}.tab.active{display:block}
+.metric{padding:12px}
+.mhead{display:flex;align-items:baseline;gap:8px;cursor:pointer;-webkit-user-select:none;user-select:none}
+
+.mlabel{font-size:21px;color:#fff}
+.mhead .status{font-size:12px;margin-left:6px}
+.mval{margin-left:auto;font-size:29px;font-weight:700;line-height:1.1;text-align:right}
+#v-t{color:#f59e0b}
+#v-h{color:#38bdf8}
+#v-co2{color:#22c55e}
+#v-co2.heat{color:var(--bad);font-size:30px}   /* ♨️ вместо цифр во время прогрева */
+.marrow{color:var(--mut);font-size:12px;width:14px;text-align:center;flex:0 0 auto}
+.mchart{margin-top:10px}
+.prow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap}
+.prow label{color:var(--mut);font-size:14px;white-space:nowrap}
+.prow select,.prow input[type=number]{flex:1 1 auto;min-width:0;width:100%}
+.prow select{text-align:right;text-align-last:right;padding-right:34px}
+.prow > button.btn{margin-left:auto;margin-right:auto}
+.pbtns{justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
+input[type=number]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;text-align:right}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.heat{color:var(--bad)}
+.panel{background:var(--card);border-radius:14px;padding:12px;margin-bottom:12px;min-width:0}
+.panel h2{font-size:14px;margin-bottom:10px;color:var(--acc)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text],input[type=password]{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:9px 12px;border-radius:8px;font-size:16px;max-width:100%}
+button.btn{background:var(--acc);border:none;color:#04263a;padding:9px 14px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+button.btn.sec{background:#334155;color:var(--txt)}
+button.btn.warn{background:var(--warn);color:#241503}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #334155;color:var(--mut)}
+th{color:var(--txt)}
+/* Блок последних записей: прокрутка внутри блока, шапка таблицы закреплена */
+.tblwrap{max-height:46vh;overflow:auto;-webkit-overflow-scrolling:touch;border-radius:8px}
+.tblwrap thead th{position:sticky;top:0;z-index:1;background:var(--card);box-shadow:inset 0 -1px 0 #334155}
+canvas{display:block;width:100%}
+select{background:#0f172a;border:1px solid #334155;color:var(--txt);padding:8px;border-radius:8px;max-width:100%}
+#msg{font-size:13px;color:var(--ok);min-height:18px;margin-top:8px}
+@media(min-width:760px){
+ header{padding:14px 24px;flex-direction:row;align-items:center;flex-wrap:wrap;gap:12px}
+ .badges{margin-left:auto}
+ nav{padding:8px 24px}
+ nav button{font-size:14px;padding:8px 16px}
+ main{padding:24px}
+ .metric{padding:16px}
+ .mlabel{font-size:19px}
+ .mval{font-size:36px}
+ .mhead .status{font-size:13px}
+ .panel{border-radius:16px;padding:18px;margin-bottom:16px}
+ .panel h2{font-size:15px}
+ table{font-size:13px}
+ th,td{padding:7px 10px}
+}
+
+</style>
+</head>
+<body>
+<header>
+  <h1>🌿 Климат-монитор</h1>
+  <div class="badges">
+    <span class="badge" id="netBadge">—</span>
+    <span class="badge" id="logBadge">—</span>
+    <span class="badge" id="timeBadge">—</span>
+    <span class="badge" id="upBadge">—</span>
+  </div>
+</header>
+<nav>
+  <button class="active" data-tab="live" onclick="showTab('live')">Показания</button>
+  <button data-tab="wifi" onclick="showTab('wifi')">Wi-Fi</button>
+  <button data-tab="calib" onclick="showTab('calib')">Калибровка MH-Z19</button>
+  <button data-tab="data" onclick="showTab('data')">Данные</button>
+</nav>
+<main>
+
+<div class="tab active" id="tab-live">
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('t')">
+      <span class="mlabel">Температура<span class="status" id="s-dht"></span></span>
+      <span class="mval" id="v-t">—</span>
+      <span class="marrow" id="ar-t">▸</span>
+    </div>
+    <div class="mchart" id="c-t" style="display:none"><canvas id="ch-t"></canvas></div>
+  </div>
+
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('h')">
+      <span class="mlabel">Влажность</span>
+      <span class="mval" id="v-h">—</span>
+      <span class="marrow" id="ar-h">▸</span>
+    </div>
+    <div class="mchart" id="c-h" style="display:none"><canvas id="ch-h"></canvas></div>
+  </div>
+
+  <div class="panel metric">
+    <div class="mhead" onclick="toggleChart('co2')">
+      <span class="mlabel">CO₂<span class="status" id="s-mhz"></span></span>
+      <span class="mval" id="v-co2">—</span>
+      <span class="marrow" id="ar-co2">▸</span>
+    </div>
+    <div class="mchart" id="c-co2" style="display:none"><canvas id="ch-co2"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <div class="prow">
+      <label for="rangeSel">Период:</label>
+        <select id="rangeSel" onchange="setRange()">
+          <option value="6">6 часов</option>
+          <option value="12" selected>12 часов</option>
+          <option value="24">1 сутки</option>
+          <option value="48">2 суток</option>
+          <option value="120">5 суток</option>
+          <option value="0">Вся история</option>
+        </select>
+    </div>
+  </div>
+</div>
+
+<div class="tab" id="tab-wifi">
+  <div class="panel">
+    <h2>Подключение к домашней сети (STA)</h2>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px">После подключения устройство перезагрузится и выйдет в интернет через роутер. Точка доступа <b>CO2Monitor</b> остаётся резервным режимом, если сеть недоступна.<br>Если сохранённой сети нет (сразу после прошивки), устройство само попробует подключиться к сети по умолчанию.</p>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px">Устройство доступно по имени <b>http://climat.local</b> — IP искать не нужно. В режиме точки доступа работает любой адрес (например http://climat.it): встроенный DNS отвечает на все имена.</p>
+    <div class="row">
+      <input type="text" id="wssid" placeholder="SSID сети">
+      <input type="password" id="wpass" placeholder="Пароль">
+      <button class="btn" onclick="saveWifi()">Сохранить и подключить</button>
+      <button class="btn warn" onclick="clearWifi()">Забыть сеть (режим AP)</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+</div>
+
+<div class="tab" id="tab-calib">
+  <div class="panel">
+    <h2>Ручная калибровка MH-Z19</h2>
+    <p style="color:var(--mut);font-size:13px;margin-bottom:12px"><b>Zero calibration (400 ppm)</b> — вынесите датчик на свежий воздух на 20 минут, затем нажмите. Требуется прогрев датчика ≥ 48 часов.<br><b>Span calibration (2000 ppm)</b> — с эталонным газом 2000 ppm.</p>
+    <div class="row">
+      <button class="btn" onclick="calibrate('zero')">Cal Zero (400 ppm)</button>
+      <button class="btn" onclick="calibrate('span')">Cal Span (2000 ppm)</button>
+      <button class="btn sec" onclick="calibrate('abc_on')">Автокалибровка ВКЛ</button>
+      <button class="btn sec" onclick="calibrate('abc_off')">Автокалибровка ВЫКЛ</button>
+    </div>
+    <div id="calmsg" style="color:var(--ok);font-size:13px;margin-top:10px;min-height:18px"></div>
+  </div>
+  <div class="panel">
+    <h2>Статус датчика</h2>
+    <div class="row"><button class="btn sec" onclick="loadStatus()">Обновить</button></div>
+    <div id="calstat" style="font-size:13px;color:var(--mut);margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="tab" id="tab-data">
+  <div class="panel">
+    <h2>Настройки записи</h2>
+    <div class="prow">
+      <label>Точка в память (сек):</label>
+      <input type="number" id="setPointSec" min="5" max="600" step="5">
+    </div>
+    <div class="prow" style="margin-top:10px">
+      <label>Сохранение в файл (мин):</label>
+      <input type="number" id="setSaveMin" min="1" max="1440" step="1">
+    </div>
+    <div class="prow pbtns">
+      <button class="btn" onclick="saveSettings()">Сохранить</button>
+    </div>
+    <div id="setmsg" style="font-size:13px;color:var(--ok);min-height:18px;margin-top:8px"></div>
+    <p style="color:var(--mut);font-size:12px">Точки в память попадают в графики (плавная линия), но не пишутся во flash. В файл сохраняются реже — для длительной истории.</p>
+  </div>
+  <div class="panel">
+    <h2>Файлы логов (LittleFS)</h2>
+    <div id="files" style="font-size:13px;color:var(--mut)">—</div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
+      <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
+    </div>
+  </div>
+  <div class="panel"><h2>Последние записи</h2><div class="tblwrap"><table id="tbl"><thead><tr><th>Дата/время</th><th>T °C</th><th>RH %</th><th>CO₂ ppm</th></tr></thead><tbody></tbody></table></div></div>
+</div>
+
+</main>
+<script>
+let hist=[];
+let histRange=null;   
+let lastSeq=-1;  
+let timeOkFlag=true;   // true = на первой загрузке перезагрузка графиков не нужна
+let upBase=0, upAt=0;  // время работы: секунды с устройства + момент их получения
+let statsFiles=0, statsRam=0;   // записей в файлах и в ОЗУ (из /api/current)
+let statsFirst=0, statsLast=0;  // самая ранняя сохранённая и самая новая точка
+let currentTab='live';
+const $=id=>document.getElementById(id);
+
+const LS_KEY='co2mon.ui';
+function saveUi(){
+ try{ localStorage.setItem(LS_KEY, JSON.stringify(
+   {open:openCharts, range:$('rangeSel').value, tab:currentTab})); }catch(e){}
+}
+function loadUi(){
+ try{
+  const u=JSON.parse(localStorage.getItem(LS_KEY)||'{}');
+  if(u.range && $('rangeSel').querySelector('option[value="'+u.range+'"]')) $('rangeSel').value=u.range;
+  if(u.open) for(const k in MET){
+   openCharts[k]=!!u.open[k];
+   $(MET[k].box).style.display=openCharts[k]?'block':'none';
+   $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
+  }
+  if(u.tab) showTab(u.tab);
+ }catch(e){}
+}
+function setRange(){ saveUi(); loadCharts(true); }
+
+function showTab(t){currentTab=t;
+document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
+$('tab-'+t).classList.add('active');
+document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
+if(t==='data'){loadData();loadSettings();} if(t==='calib')loadStatus();
+if(t==='live')drawAll();
+saveUi();}
+
+const MET={
+ t:{cv:'ch-t',box:'c-t',ar:'ar-t',color:'#f59e0b',label:'°C',field:'t'},
+ h:{cv:'ch-h',box:'c-h',ar:'ar-h',color:'#38bdf8',label:'%',field:'h'},
+ co2:{cv:'ch-co2',box:'c-co2',ar:'ar-co2',color:'#22c55e',label:'ppm',field:'co2'}
+};
+let openCharts={t:false,h:false,co2:false};  
+
+// Отрисовка рассчитана на обновление раз в 5 секунд, поэтому:
+//  • ширину канвасов читаем одним заходом (это чтение layout), затем только
+//    рисуем — иначе каждая следующая диаграмма вызывает принудительный reflow;
+//  • если данные и размер не менялись, перерисовки нет вообще.
+function chartJobs(){
+ const jobs=[];
+ for(const k in MET){
+  if(!openCharts[k])continue;
+  const m=MET[k], cv=$(m.cv); if(!cv)continue;
+  jobs.push({cv,w:Math.max(160,cv.clientWidth||600),m});
+ }
+ return jobs;
+}
+function drawKey(){return currentTab+'|'+window.innerWidth+'|'+hist.length+'|'+(hist.length?hist[hist.length-1].ts:'')+'|'+Object.keys(MET).filter(k=>openCharts[k]).join(',');}
+let lastDrawKey='';
+function drawAll(){
+ if(currentTab!=='live')return;           // графики видны только на этой вкладке
+ const key=drawKey();
+ if(key===lastDrawKey)return;
+ lastDrawKey=key;
+ for(const j of chartJobs())drawChart(j.cv,j.m.color,j.m.label,hist,j.m.field,j.w);
+}
+function drawOne(k){
+ const m=MET[k]; if(!m)return;
+ const cv=$(m.cv); if(!cv)return;
+ drawChart(cv,m.color,m.label,hist,m.field,Math.max(160,cv.clientWidth||600));
+}
+
+function toggleChart(k){
+ openCharts[k]=!openCharts[k];
+ $(MET[k].box).style.display=openCharts[k]?'block':'none';
+ $(MET[k].ar).textContent=openCharts[k]?'▾':'▸';
+ if(openCharts[k]){drawOne(k);loadCharts(true);}  
+ saveUi();
+}
+
+function drawChart(cv,color,label,data,yfield,w){
+ if(!cv)return;
+ const h=window.innerWidth<760?190:280;
+ const dpr=window.devicePixelRatio||1;
+ // Буфер канваса пересоздаём только при реальном изменении размера: эта
+ // операция заново выделяет память под весь растр (на телефоне — мегабайты).
+ const W=Math.round(w*dpr), H=Math.round(h*dpr);
+ if(cv.width!==W||cv.height!==H){cv.width=W; cv.height=H;}
+ if(cv.style.height!==h+'px')cv.style.height=h+'px';
+ const g=cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+ const pad={l:44,r:10,t:16,b:24};
+ // min/max одним проходом: без map() и Math.min(...arr) — это лишние массивы
+ let min=Infinity, max=-Infinity;
+ for(let i=0;i<data.length;i++){
+  let v=Number(data[i][yfield]); if(!isFinite(v))v=0;
+  if(v<min)min=v; if(v>max)max=v;
+ }
+ if(!isFinite(min)||!isFinite(max)){min=0;max=1;}
+ if(min===max){min-=1;max+=1;}
+ const pw=w-pad.l-pad.r, ph=h-pad.t-pad.b;
+ g.lineWidth=1; g.strokeStyle='#334155'; g.fillStyle='#94a3b8'; g.font='11px sans-serif';
+ for(let i=0;i<=4;i++){
+  const y=pad.t+ph*i/4;
+  g.beginPath(); g.moveTo(pad.l,y); g.lineTo(w-pad.r,y); g.stroke();
+  const v=max-(max-min)*i/4; g.fillText(v.toFixed(1),4,y+4);
+ }
+ if(data.length){
+  // Ось X — по времени, а не по номеру точки: иначе 5-минутные точки старой
+  // части и 5-секундные свежие делят ширину поровну и период «не соблюдается».
+  const t0=Number(data[0].ts)||0, t1=Number(data[data.length-1].ts)||0;
+  const span=(t1>t0)?(t1-t0):0;
+  const X=ts=>span?(pad.l+pw*Math.max(0,Math.min(1,(Number(ts)-t0)/span))):pad.l+pw/2;
+  const fs=String(data[0].dt||'').slice(5,16), ls=String(data[data.length-1].dt||'').slice(5,16);
+  g.fillText(fs,pad.l,h-8);
+  g.fillText(ls,w-pad.r-g.measureText(ls).width,h-8);
+  g.beginPath(); g.strokeStyle=color; g.lineWidth=2;
+  for(let i=0;i<data.length;i++){
+   const d=data[i];
+   const x=(data.length>1)?X(d.ts):pad.l+pw/2;
+   let v=Number(d[yfield]); if(!isFinite(v))v=0;
+   const y=pad.t+ph*(1-(v-min)/(max-min));
+   i?g.lineTo(x,y):g.moveTo(x,y);
+  }
+  g.stroke();
+  g.lineTo(pad.l+pw,pad.t+ph); g.lineTo(pad.l,pad.t+ph); g.closePath();
+  g.fillStyle=color+'22'; g.fill();
+ }
+ g.fillStyle='#e2e8f0'; g.font='12px sans-serif';
+ g.fillText(label,pad.l,11);
+}
+
+async function api(u){const r=await fetch(u,{cache:'no-store'});return r.json();}
+
+async function pollLive(){
+ try{
+  const s=await api('/api/current');
+  $('v-t').innerHTML=s.temperature.toFixed(1);
+  $('v-h').innerHTML=s.humidity.toFixed(1);
+  const heat=!!s.heating;
+  $('v-co2').classList.toggle('heat',heat);
+  if(heat){
+   $('v-co2').innerHTML='♨️';
+   $('s-mhz').innerHTML='<span class="heat">идёт прогрев, '+(s.heatLeft||0)+' с</span>';
+  }else{
+   $('v-co2').innerHTML=s.co2;
+   $('s-mhz').innerHTML=s.mhzOk?'<span class="ok"></span>':'<span class="bad">MH-Z19 нет связи</span>';
+  }
+  $('s-dht').innerHTML=s.dhtOk?'<span class="ok"></span>':'<span class="bad">DHT22 нет связи</span>';
+  $('netBadge').textContent=(s.mode==='AP'?'Точка доступа':'Сеть: '+s.ip)+(s.mdnsOk?' · '+s.mdns:'');
+  $('netBadge').title=s.mdnsOk?('Можно открывать по имени: http://'+s.mdns):'mDNS не запущен — используйте IP';
+  $('timeBadge').textContent='Дата: '+s.datetime;
+  upBase=s.uptime||0; upAt=Date.now();
+  statsFiles=s.logRows||0; statsRam=s.points||0;
+  statsFirst=s.firstTs||0; statsLast=s.timestamp||0;
+  updateLogBadge();
+ 
+  // Часы могли появиться уже после первого запроса истории (тогда сервер отдал
+  // всю историю). Как только время известно — перечитываем строго за период.
+  if(s.timeOk&&!timeOkFlag){ timeOkFlag=true; histRange=null; loadCharts(true); }
+  else if(!s.timeOk) timeOkFlag=false;
+
+  if(s.pointsSeq!==lastSeq){ lastSeq=s.pointsSeq; loadCharts(false); }
+ }catch(e){}
+ setTimeout(pollLive,5000);}
+
+let chartsTimer=null;
+let chartsBusy=false, chartsQueued=false, chartsQueuedFull=false;
+async function loadCharts(full){
+ // Запросы не пересекаем: полная загрузка и лёгкая дельта могли бы вернуться
+ // вразнобой и перемешать hist/histRange (гонка на async без токена).
+ if(chartsBusy){ chartsQueued=true; chartsQueuedFull=chartsQueuedFull||!!full; return; }
+ chartsBusy=true;
+ try{
+  const hours=$('rangeSel').value;
+  const hrs=parseFloat(hours)||0;
+  if(full||!hist.length||histRange!==hours){
+   // полная загрузка: при открытии, смене периода и раз в 2 минуты
+   histRange=hours;
+   hist=await api('/api/history?hours='+hours);
+  }else{
+   // живое обновление: догружаем только новые точки (лёгкий запрос)
+   const since=hist.length?hist[hist.length-1].ts:0;
+   const add=await api('/api/history?since='+since);
+   if(add&&add.length)hist=hist.concat(add);
+  }
+  // Окно периода держим ВСЕГДА — в том числе на первой загрузке. После
+  // прошивки RTC сброшен и NTP может ещё не пройти: сервер не вычислит since
+  // и вернёт всю историю. Обрезаем на клиенте, иначе первый кадр — «за всё время».
+  const last=hist.length?Number(hist[hist.length-1].ts)||0:0;
+  if(hrs>0&&last>0){
+   const cut=last-hrs*3600;
+   hist=hist.filter(d=>Number(d.ts)>=cut);
+  }
+  const cap=hrs>0?600:1500;
+  if(hist.length>cap)hist=hist.slice(hist.length-cap);
+  drawAll();
+  updateLogBadge();
+ }catch(e){}
+ chartsBusy=false;
+ if(chartsQueued){ const f=chartsQueuedFull; chartsQueued=false; chartsQueuedFull=false; loadCharts(f); }
+}
+function startChartsLive(){ if(chartsTimer)clearInterval(chartsTimer); chartsTimer=setInterval(()=>loadCharts(true),120000); }
+
+async function loadData(){
+ try{
+  const files=await api('/api/files');
+  $('files').innerHTML=files.length?('Файлов: '+files.length+'<br>'+files.join('<br>')):'Нет файлов';
+  const h=await api('/api/history?points=50');
+  const tb=$('tbl').querySelector('tbody');tb.innerHTML='';
+  const rows=h.slice(-50).reverse();
+  let html='';
+  rows.forEach(d=>{html+=`<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`;});
+  tb.innerHTML=html;
+  $('files').innerHTML+='<br><span style="color:var(--mut)">Показаны последние 50 из '+h.length+' запрошенных точек. Полные данные — в графиках и CSV.</span>';
+ }catch(e){}}
+
+async function saveWifi(){
+ const b=new URLSearchParams({ssid:$('wssid').value,pass:$('wpass').value});
+ const r=await fetch('/api/wifi/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
+ $('msg').textContent=await r.text();setTimeout(()=>location.reload(),4000);}
+
+async function clearWifi(){
+ await fetch('/api/wifi/clear',{method:'POST'});$('msg').textContent='Сеть забыта, возврат в режим AP...';
+ setTimeout(()=>location.href='http://192.168.4.1',5000);}
+
+async function calibrate(cmd){
+ $('calmsg').textContent='Отправка команды...';
+ const r=await fetch('/api/calibrate?type='+cmd);
+ $('calmsg').textContent=await r.text();}
+
+async function loadStatus(){
+ try{const s=await api('/api/sensor');
+  $('calstat').innerHTML=`Диапазон: ${s.range} ppm · ABC: ${s.abc===1||s.abc===true?'вкл':'выкл'} · CO₂ сейчас: ${s.heating?'♨️':s.co2+' ppm'} · Связь: ${s.heating?'прогрев':(s.mhzOk?'OK':'нет данных')}`;
+ }catch(e){$('calstat').textContent='Ошибка запроса';}}
+
+async function clearLogs(){
+ if(!confirm('Удалить все файлы логов?'))return;
+ let msg='';
+ for(let i=0;i<40;i++){
+   const r=await fetch('/api/logs/clear',{method:'POST'});
+   msg=await r.text();
+   if(msg==='Логи удалены')break;                 // сервер стирает порциями
+   await new Promise(res=>setTimeout(res,300));   // даём питанию/флешу передохнуть
+ }
+ alert(msg);loadData();}
+
+async function loadSettings(){
+ try{const s=await api('/api/settings');
+  $('setPointSec').value=s.pointSec; $('setSaveMin').value=s.saveMin;
+  $('setPointSec').min=s.minPointSec; $('setPointSec').max=s.maxPointSec;
+  $('setSaveMin').min=s.minSaveMin; $('setSaveMin').max=s.maxSaveMin;
+ }catch(e){}}
+
+async function saveSettings(){
+ const b=new URLSearchParams({pointSec:$('setPointSec').value,saveMin:$('setSaveMin').value});
+ const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});
+ $('setmsg').textContent=await r.text(); loadCharts(true);}
+
+function exportCsv(){location.href='/api/export';}
+
+// Время работы с момента включения: показываем посекундно, раз в 5 с
+// синхронизируем с устройством (иначе секунды прыгали бы по 5).
+function fmtUptime(t){
+ t=Math.max(0,Math.floor(t));
+ const d=Math.floor(t/86400), h=Math.floor(t%86400/3600), m=Math.floor(t%3600/60), s=t%60;
+ const p=n=>String(n).padStart(2,'0');
+ return (d>0?d+' д ':'')+p(h)+':'+p(m)+':'+p(s);
+}
+function tickUptime(){
+ if(!upAt)return;
+ $('upBadge').textContent='Время работы: '+fmtUptime(upBase+Math.floor((Date.now()-upAt)/1000));
+}
+
+// Бейдж показывает, сколько измерений всего сохранено (файлы + ОЗУ), и период
+// от самой ранней сохранённой точки до самой новой — а не окно графика.
+function logSpan(){
+ const t0=Number(statsFirst)||0, t1=Number(statsLast)||0;
+ if(!t0||!t1||t1<=t0)return '';
+ const sec=t1-t0;
+ if(sec<3600)return ' · '+Math.max(1,Math.round(sec/60))+' мин';
+ const h=sec/3600;
+ return h>=24?(' · '+Math.round(h/24)+' сут'):(' · '+Math.round(h)+' ч');
+}
+function updateLogBadge(){
+ $('logBadge').textContent='Записей: '+(statsFiles+statsRam)+logSpan();
+ $('logBadge').title='В файлах: '+statsFiles+' · в ОЗУ: '+statsRam+' · на графике: '+hist.length;
+}
+window.addEventListener('resize',drawAll);
+loadUi();
+pollLive();
+loadCharts(true);
+startChartsLive();
+setInterval(tickUptime,1000);
+</script>
+</body>
+</html>

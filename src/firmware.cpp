@@ -31,7 +31,7 @@
 #define MAX_SAVE_MIN       1440
 #define MAX_LIVE_POINTS    1440
 #define MAX_HISTORY_OUT    400
-#define MAX_FILE_ROWS      1500
+#define MAX_FILE_ROWS      500
 #define MHZ19_HEATING_TIME (1000UL * 60UL * 3UL)
 
 const char *AP_SSID = "CO2Monitor";
@@ -609,6 +609,9 @@ static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
 }
 
 static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
+  Serial.printf("[MEM] sendHistory: free heap=%u, largest block=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+              
   int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
 
   int lh, lc;
@@ -1172,6 +1175,10 @@ static void setupNetwork() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  
+  esp_reset_reason_t reason = esp_reset_reason();
+  Serial.printf("[BOOT] reset reason=%d\n\n", reason);
+
   Serial.println("\n=== Climat Monitor ===");
 
   mhzMutex = xSemaphoreCreateMutex();

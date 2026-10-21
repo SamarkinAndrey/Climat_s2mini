@@ -9,11 +9,10 @@
 #include <MHZ19.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <algorithm>
 #include <freertos/semphr.h>
-#include <memory>
 #include <string.h>
-#include <vector>
 
 #define DHT_PIN            5
 #define DHT_TYPE           22
@@ -23,15 +22,23 @@
 #define MAX_LOG_FILES      20
 #define NTP_SERVER         "ru.pool.ntp.org"
 #define MDNS_HOST          "climat"
-#define DEFAULT_POINT_SEC  30
-#define DEFAULT_SAVE_MIN   5
+// Минутные средние: опрос датчиков каждые 5 с, 12 измерений на минуту.
+// Запись на флеш — часовой пачкой (flushHourToFlash), поэтому saveMin задаёт
+// только нижнюю границу защиты от частой записи и отображается в настройках.
+#define SENSOR_PERIOD_MS   5000UL
+#define DEFAULT_POINT_SEC  60
+#define DEFAULT_SAVE_MIN   60
 #define MIN_POINT_SEC      5
 #define MAX_POINT_SEC      600
-#define MIN_SAVE_MIN       1
+#define MIN_SAVE_MIN       10
 #define MAX_SAVE_MIN       1440
-#define MAX_LIVE_POINTS    1440
-#define MAX_HISTORY_OUT    400
+#define MAX_LIVE_POINTS    720
+#define MAX_HISTORY_OUT    300
 #define MAX_FILE_ROWS      500
+#define HISTORY_STEP       5
+#define SAMPLES_PER_MIN    12
+#define FRONT_CAP_PERIOD   400
+#define FRONT_CAP_ALL      800
 #define MHZ19_HEATING_TIME (1000UL * 60UL * 3UL)
 
 const char *AP_SSID = "CO2Monitor";
@@ -90,6 +97,7 @@ uint32_t heatingStartMs  = 0;
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
 uint32_t lastPointMs     = 0;
+uint16_t accN            = 0; // тиков накопления в текущую минуту (из 12)
 bool     apMode          = true;
 bool     timeSynced      = false;
 uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;
@@ -109,6 +117,54 @@ Point               liveBuf[MAX_LIVE_POINTS];
 int                 liveHead  = 0;
 int                 liveCount = 0;
 static portMUX_TYPE liveMux   = portMUX_INITIALIZER_UNLOCKED;
+
+// ---------- Внешний блок (ESP32-C3 + BME280), приём по ESP-NOW ----------
+// Пакет одинаковой структуры на обеих платах (см. src/external_block.ino).
+struct SensorPacket {
+  uint32_t magic;     // 0x434C4931 ("CLI1")
+  float    temp;      // температура внешнего блока, °C
+  float    hum;       // влажность внешнего блока, %
+  float    press;     // давление, гПа
+  float    batt;      // напряжение аккумулятора, В
+  uint32_t uptime;    // секунды работы внешнего блока с последней перезагрузки
+  uint32_t timestamp; // 0 — внутренняя плата подставит своё время
+};
+
+#define EXT_MAGIC   0x434C4931UL
+#define MAX_EXT_PTS 720 // ~сутки минутных средних внешнего блока
+
+struct ExtAvg {
+  float    t, h, p, b;
+  uint32_t ts;
+};
+
+static ExtAvg extBuf[MAX_EXT_PTS];
+static int    extHead  = 0;
+static int    extCount = 0;
+static uint32_t extSeq = 0;
+static bool   extSeen = false;      // хоть один пакет принят
+static uint32_t extLastRxMs = 0;    // millis() последнего пакета
+static portMUX_TYPE extMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Аккумуляторы минутных средних (внутренний и внешний блоки)
+struct MinAcc {
+  float    t = 0, h = 0, p = 0, b = 0;
+  uint32_t co2   = 0;
+  uint16_t nTh   = 0; // успешных измерений DHT за минуту
+  uint16_t nCo2  = 0; // успешных измерений MH-Z19 за минуту
+  uint16_t nExt  = 0; // пакетов внешнего блока за минуту
+};
+static MinAcc accIn, accExt;
+
+struct MinuteAvg {
+  float    t, h;
+  uint16_t co2;
+  uint32_t ts;
+};
+static MinuteAvg    hourBuf[60];
+static uint8_t      hourCount = 0;
+static ExtAvg extHourBuf[60];
+static uint8_t      extHourCount = 0;
 
 String cfgSsid, cfgPass;
 int    mhzRange = 5000;
@@ -144,10 +200,14 @@ static String todayFile() {
   return String(name);
 }
 
-static void listFiles(const char *dirPath, std::vector<String> &out) {
+// Статический список файлов логов (без std::vector — не фрагментируем кучу).
+#define MAX_LIST_FILES 32
+
+static int listFiles(const char *dirPath, String *names, int maxNames) {
   File dir = LittleFS.open(dirPath);
   if (!dir || !dir.isDirectory())
-    return;
+    return 0;
+  int cnt = 0;
   for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
     if (entry.isDirectory()) {
       entry.close();
@@ -157,11 +217,19 @@ static void listFiles(const char *dirPath, std::vector<String> &out) {
     int    slash = name.lastIndexOf('/');
     if (slash >= 0)
       name = name.substring(slash + 1);
-    if (name.length())
-      out.push_back(String(dirPath) + "/" + name);
+    if (name.length() && cnt < maxNames)
+      names[cnt++] = String(dirPath) + "/" + name;
     entry.close();
   }
   dir.close();
+  return cnt;
+}
+
+static void sortNames(String *names, int n) {
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++)
+      if (names[j] < names[i])
+        std::swap(names[i], names[j]);
 }
 
 static uint32_t countFileRows(const String &path) {
@@ -203,51 +271,68 @@ static uint32_t firstFileTs(const String &path) {
 }
 
 static void recountLogRows() {
-  std::vector<String> names;
-  listFiles(LOGS_DIR, names);
+  static String names[MAX_LIST_FILES];
+  int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
   uint32_t total = 0;
-  for (const String &n : names)
-    total += countFileRows(n);
+  for (int i = 0; i < n; i++)
+    total += countFileRows(names[i]);
   logRowsTotal = total;
 
   oldestSavedTs = 0;
-  if (!names.empty()) {
+  if (n > 0) {
     int oi = 0;
-    for (size_t i = 1; i < names.size(); i++)
+    for (int i = 1; i < n; i++)
       if (names[i] < names[oi])
         oi = i;
     oldestSavedTs = firstFileTs(names[oi]);
   }
   Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
-                (unsigned)names.size(), (unsigned long)total,
-                (unsigned long)oldestSavedTs);
+                (unsigned)n, (unsigned long)total, (unsigned long)oldestSavedTs);
 }
 
 static void rotateLogsIfNeeded() {
-  std::vector<String> names;
-  listFiles(LOGS_DIR, names);
+  static String names[MAX_LIST_FILES];
+  int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
 
   int removed = 0;
-  while (names.size() > MAX_LOG_FILES && removed < 2) {
+  while (n > MAX_LOG_FILES && removed < 2) {
     int oldestIdx = 0;
-    for (size_t i = 1; i < names.size(); i++)
+    for (int i = 1; i < n; i++)
       if (names[i] < names[oldestIdx])
         oldestIdx = i;
     Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
     uint32_t gone = countFileRows(names[oldestIdx]);
     logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
     LittleFS.remove(names[oldestIdx]);
-    names.erase(names.begin() + oldestIdx);
+    for (int i = oldestIdx; i < n - 1; i++)
+      names[i] = names[i + 1];
+    n--;
     removed++;
     oldestSavedTs = 0;
-    if (!names.empty()) {
+    if (n > 0) {
       int oi = 0;
-      for (size_t i = 1; i < names.size(); i++)
+      for (int i = 1; i < n; i++)
         if (names[i] < names[oi])
           oi = i;
       oldestSavedTs = firstFileTs(names[oi]);
     }
   }
+}
+
+static String extTodayFile() {
+  time_t    now = time(nullptr);
+  struct tm t;
+  if (timeSynced && now > 1000000) {
+    localtime_r(&now, &t);
+  } else {
+    memset(&t, 0, sizeof(t));
+    t.tm_year = 100;
+    t.tm_mon  = 0;
+    t.tm_mday = 1;
+  }
+  char name[40];
+  sprintf(name, "%s/ext_%04d-%02d-%02d.csv", LOGS_DIR, t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  return String(name);
 }
 
 static void logReading(const Reading &r) {
@@ -310,6 +395,72 @@ static Point liveGet(int idx) {
   p = liveBuf[idx];
   portEXIT_CRITICAL(&liveMux);
   return p;
+}
+
+static void pushExtAvg(const ExtAvg &a) {
+  portENTER_CRITICAL(&extMux);
+  ExtAvg &p = extBuf[extHead];
+  p         = a;
+  extHead   = (extHead + 1) % MAX_EXT_PTS;
+  if (extCount < MAX_EXT_PTS)
+    extCount++;
+  extSeq++;
+  portEXIT_CRITICAL(&extMux);
+}
+
+static void extSnapshot(int &head, int &count) {
+  portENTER_CRITICAL(&extMux);
+  head  = extHead;
+  count = extCount;
+  portEXIT_CRITICAL(&extMux);
+}
+
+static ExtAvg extGet(int idx) {
+  ExtAvg a;
+  portENTER_CRITICAL(&extMux);
+  a = extBuf[idx];
+  portEXIT_CRITICAL(&extMux);
+  return a;
+}
+
+// ---------- ESP-NOW: приём пакетов внешнего блока ----------
+static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(SensorPacket))
+    return;
+  SensorPacket pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+  if (pkt.magic != EXT_MAGIC)
+    return;
+  // значения должны быть физическими, иначе пакет битый
+  if (!(pkt.temp > -60 && pkt.temp < 60))
+    return;
+  if (!(pkt.hum >= 0 && pkt.hum <= 100))
+    return;
+
+  uint32_t ts = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+  portENTER_CRITICAL(&extMux);
+  extSeen     = true;
+  extLastRxMs = millis();
+  portEXIT_CRITICAL(&extMux);
+
+  accExt.t += pkt.temp;
+  accExt.h += pkt.hum;
+  accExt.p += pkt.press;
+  accExt.b += pkt.batt;
+  accExt.nExt++;
+}
+
+static void setupEspNow() {
+  WiFi.mode(WIFI_AP_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESPNOW] ошибка инициализации — внешний блок не принимается");
+    return;
+  }
+  esp_now_register_recv_cb(onEspNowRecv);
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  Serial.printf("[ESPNOW] приём включён, MAC этой платы: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 static portMUX_TYPE latestMux = portMUX_INITIALIZER_UNLOCKED;
@@ -415,6 +566,128 @@ static void readSensors() {
   setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
 }
 
+// Минутные средние: вызывается из loop() каждые SENSOR_PERIOD_MS.
+// Раз в SAMPLES_PER_MIN тиков закрывает минуту: среднее идёт в liveBuf/extBuf
+// (для графиков и /api/history?since=) и в часовые буферы для записи на флеш.
+static void accumulateMinute() {
+  Reading r = getLatest();
+  bool    thOk  = dhtOk && !isnan(r.temperature) && !isnan(r.humidity);
+  bool    co2Ok = mhzOk && !mhzHeating && r.co2 > 0;
+
+  if (thOk) {
+    accIn.t += r.temperature;
+    accIn.h += r.humidity;
+    accIn.nTh++;
+  }
+  if (co2Ok) {
+    accIn.co2 += r.co2;
+    accIn.nCo2++;
+  }
+
+  // внешний блок считаем живым, если пакет был за последние 15 минут
+  bool extAlive;
+  portENTER_CRITICAL(&extMux);
+  extAlive = extSeen && (millis() - extLastRxMs < 15UL * 60UL * 1000UL);
+  portEXIT_CRITICAL(&extMux);
+  if (!extAlive)
+    accExt.nExt = 0;
+
+  if (++accN < SAMPLES_PER_MIN)
+    return;
+
+  // ---- минута закрылась ----
+  uint32_t ts = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+
+  if (accIn.nTh || accIn.nCo2) {
+    float avgT   = accIn.nTh ? accIn.t / accIn.nTh : r.temperature;
+    float avgH   = accIn.nTh ? accIn.h / accIn.nTh : r.humidity;
+    uint16_t avgCo2 = accIn.nCo2 ? (uint16_t)(accIn.co2 / accIn.nCo2) : 0;
+
+    Reading avg;
+    avg.timestamp   = ts;
+    avg.temperature = avgT;
+    avg.humidity    = avgH;
+    avg.co2         = avgCo2;
+    pushLivePoint(avg);
+
+    if (hourCount < 60) {
+      hourBuf[hourCount].t   = avgT;
+      hourBuf[hourCount].h   = avgH;
+      hourBuf[hourCount].co2 = avgCo2;
+      hourBuf[hourCount].ts  = ts;
+      hourCount++;
+    }
+  }
+
+  if (accExt.nExt) {
+    ExtAvg ea;
+    ea.t  = accExt.t / accExt.nExt;
+    ea.h  = accExt.h / accExt.nExt;
+    ea.p  = accExt.p / accExt.nExt;
+    ea.b  = accExt.b / accExt.nExt;
+    ea.ts = ts;
+    pushExtAvg(ea);
+    if (extHourCount < 60) {
+      extHourBuf[extHourCount] = ea;
+      extHourCount++;
+    }
+  }
+
+  accIn  = MinAcc();
+  accExt = MinAcc();
+  accN   = 0;
+}
+
+// Запись часовой пачки минутных средних на флеш (ресурс ФС: ~9 строк/сутки).
+static void flushHourToFlash() {
+  bool locked = fsLock(500);
+  if (!locked) {
+    Serial.println("[LOG] ФС занята, сброс часа отложен");
+    return;
+  }
+  if (!LittleFS.exists(LOGS_DIR))
+    LittleFS.mkdir(LOGS_DIR);
+
+  if (hourCount > 0) {
+    String path  = todayFile();
+    bool   isNew = !LittleFS.exists(path);
+    File   f     = LittleFS.open(path, "a");
+    if (f) {
+      if (isNew)
+        f.println("timestamp,datetime,temperature,humidity,co2");
+      for (uint8_t i = 0; i < hourCount; i++)
+        f.printf("%lu,%s,%.2f,%.2f,%u\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
+                 hourBuf[i].t, hourBuf[i].h, hourBuf[i].co2);
+      f.close();
+      logRowsTotal += hourCount;
+      Serial.printf("[LOG] часовой сброс: %u строк в %s\n", hourCount, path.c_str());
+      hourCount = 0;
+    } else {
+      Serial.println("[LOG] ошибка открытия файла, сброс отложен");
+    }
+  }
+
+  if (extHourCount > 0) {
+    String path  = extTodayFile();
+    bool   isNew = !LittleFS.exists(path);
+    File   f     = LittleFS.open(path, "a");
+    if (f) {
+      if (isNew)
+        f.println("timestamp,datetime,temperature,humidity,pressure,batt");
+      for (uint8_t i = 0; i < extHourCount; i++)
+        f.printf("%lu,%s,%.2f,%.2f,%.1f,%.2f\n", extHourBuf[i].ts,
+                 fmtTime(extHourBuf[i].ts).c_str(), extHourBuf[i].t, extHourBuf[i].h,
+                 extHourBuf[i].p, extHourBuf[i].b);
+      f.close();
+      Serial.printf("[LOG] часовой сброс ext: %u строк в %s\n", extHourCount, path.c_str());
+      extHourCount = 0;
+    }
+  }
+
+  rotateLogsIfNeeded();
+  fsUnlock();
+}
+
 static void tryNtp() {
   if (WiFi.status() != WL_CONNECTED)
     return;
@@ -493,9 +766,54 @@ static size_t jsonCurrent(char *buf, size_t n) {
   doc["nextLogInSec"] = nextIn;
   doc["pointSec"]     = pointIntervalMs / 1000;
   doc["saveMin"]      = saveIntervalMs / 60000;
+  doc["frontCap"]     = FRONT_CAP_PERIOD;
+  doc["capPeriod"]    = FRONT_CAP_PERIOD;
+  doc["capAll"]       = FRONT_CAP_ALL;
   int lvHead, lvCount;
   liveSnapshot(lvHead, lvCount);
   doc["points"] = lvCount;
+
+  // Внешний блок (ESP-NOW): последние минутные средние + статус связи
+  {
+    int eh, ec;
+    extSnapshot(eh, ec);
+    bool alive;
+    uint32_t ago = 0;
+    portENTER_CRITICAL(&extMux);
+    alive = extSeen && (millis() - extLastRxMs < 15UL * 60UL * 1000UL);
+    if (extSeen)
+      ago = (uint32_t)((millis() - extLastRxMs) / 1000UL);
+    portEXIT_CRITICAL(&extMux);
+    doc["extOnline"]  = alive;
+    doc["extSeen"]    = extSeen;
+    doc["extAgoSec"]  = ago;
+    doc["extSeq"]     = extSeq;
+    doc["extPoints"]  = ec;
+    JsonObject ep     = doc["ext"].to<JsonObject>();
+    if (ec > 0) {
+      ExtAvg a = extGet((eh - 1 + MAX_EXT_PTS) % MAX_EXT_PTS);
+      ep["t"]     = a.t;
+      ep["h"]     = a.h;
+      ep["p"]     = a.p;
+      ep["batt"]  = a.b;
+      ep["ts"]    = a.ts;
+    } else {
+      // свежий усреднённый пакет ещё не закрылся минутой — показываем аккумуляторы
+      uint16_t n = accExt.nExt;
+      if (alive && n > 0) {
+        ep["t"]    = accExt.t / n;
+        ep["h"]    = accExt.h / n;
+        ep["p"]    = accExt.p / n;
+        ep["batt"] = accExt.b / n;
+      } else {
+        ep["t"]   = nullptr;
+        ep["h"]   = nullptr;
+        ep["p"]   = nullptr;
+        ep["batt"] = nullptr;
+      }
+    }
+    ep["online"] = alive;
+  }
 
   doc["logRows"]   = logRowsTotal;
   uint32_t firstTs = oldestSavedTs;
@@ -516,17 +834,24 @@ struct HPoint {
   uint16_t co2;
 };
 
-static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &out) {
-  out.clear();
-  if (maxRows < 1)
-    return;
-  File f = LittleFS.open(path, "r");
-  if (!f)
-    return;
+// Читает последние maxRows строк файла в статическое кольцо и возвращает их
+// количество; out указывает на g_rows (не использовать повторно до конца запроса).
+static HPoint g_rows[MAX_FILE_ROWS];
+static HPoint g_ring[MAX_FILE_ROWS];
 
-  std::vector<HPoint> ring(maxRows);
-  int                 cnt = 0, head = 0;
-  char                line[128];
+static int readFileTailStatic(const String &path, int maxRows, HPoint **out) {
+  if (maxRows < 1)
+    maxRows = 1;
+  if (maxRows > MAX_FILE_ROWS)
+    maxRows = MAX_FILE_ROWS;
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    *out = g_rows;
+    return 0;
+  }
+
+  int   cnt = 0, head = 0;
+  char  line[128];
   while (f.available()) {
     size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
     if (n == 0)
@@ -549,7 +874,7 @@ static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &o
     uint32_t ts = (uint32_t)strtoul(line, nullptr, 10);
     if (ts == 0)
       continue;
-    HPoint &p = ring[head];
+    HPoint &p = g_ring[head];
     p.ts      = ts;
     p.t       = atof(c2 + 1);
     p.h       = atof(c3 + 1);
@@ -560,10 +885,12 @@ static void readFileTail(const String &path, int maxRows, std::vector<HPoint> &o
   }
   f.close();
 
+  // разворачиваем кольцо в линейный порядок (старые -> новые)
   int start = (head - cnt + maxRows) % maxRows;
-  out.reserve(cnt);
   for (int i = 0; i < cnt; i++)
-    out.push_back(ring[(start + i) % maxRows]);
+    g_rows[i] = g_ring[(start + i) % maxRows];
+  *out = g_rows;
+  return cnt;
 }
 
 static void fmtPoint(char *buf, size_t n, const HPoint &p) {
@@ -583,158 +910,183 @@ static void printPoint(Print &out, const HPoint &p, bool &first) {
   out.print(buf);
 }
 
-static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
+// Минутные средние внешнего блока (для /api/ext_history): кольцо + снимок.
+struct ExtPt {
+  uint32_t ts;
+  float    t, h, p, b;
+};
+
+static void extPointsSince(uint32_t since, ExtPt *out, int maxOut, int &nOut) {
+  nOut = 0;
+  int eh, ec;
+  extSnapshot(eh, ec);
+  int start = (eh - ec + MAX_EXT_PTS) % MAX_EXT_PTS;
+  for (int i = 0; i < ec && nOut < maxOut; i++) {
+    ExtAvg a = extGet((start + i) % MAX_EXT_PTS);
+    if (a.ts <= since)
+      continue;
+    out[nOut++] = ExtPt{a.ts, a.t, a.h, a.p, a.b};
+  }
+}
+
+static void sendExtHistory(AsyncWebServerRequest *req, uint32_t since) {
+  static ExtPt g_extOut[MAX_HISTORY_OUT];
+  int n = 0;
+  extPointsSince(since, g_extOut, MAX_HISTORY_OUT, n);
   AsyncResponseStream *resp = req->beginResponseStream("application/json");
   resp->print('[');
-  bool first = true;
-  int  lh, lc;
-  liveSnapshot(lh, lc);
-  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-  int fresh = 0;
-  for (int i = 0; i < lc; i++) {
-    if (liveGet((start + i) % MAX_LIVE_POINTS).ts > since)
-      fresh++;
-  }
-  int skip = (fresh > MAX_HISTORY_OUT) ? fresh - MAX_HISTORY_OUT : 0;
-  for (int i = 0, seen = 0; i < lc; i++) {
-    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
-    if (sp.ts <= since)
-      continue;
-    if (seen++ < skip)
-      continue;
-    printPoint(*resp, HPoint{sp.ts, sp.t, sp.h, sp.co2}, first);
+  char dt[24];
+  for (int i = 0; i < n; i++) {
+    if (i)
+      resp->print(',');
+    fmtTimeBuf(g_extOut[i].ts, dt, sizeof(dt));
+    resp->printf("{\"ts\":%lu,\"dt\":\"%s\",\"t\":%.1f,\"h\":%.1f,\"p\":%.1f,\"batt\":%.2f}",
+                 (unsigned long)g_extOut[i].ts, dt, g_extOut[i].t, g_extOut[i].h,
+                 g_extOut[i].p, g_extOut[i].b);
   }
   resp->print(']');
   req->send(resp);
 }
 
+static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
+  static HPoint g_sinceOut[MAX_HISTORY_OUT];
+  int lh, lc;
+  liveSnapshot(lh, lc);
+  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+
+  // Инкремент: все новые минутные точки без прореживания (обычно 1–5 точек).
+  int outCount = 0;
+  for (int i = 0; i < lc && outCount < MAX_HISTORY_OUT; i++) {
+    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
+    if (sp.ts <= since)
+      continue;
+    g_sinceOut[outCount++] = HPoint{sp.ts, sp.t, sp.h, sp.co2};
+  }
+
+  AsyncResponseStream *resp = req->beginResponseStream("application/json");
+  resp->print('[');
+  bool firstItem = true;
+  for (int i = 0; i < outCount; i++)
+    printPoint(*resp, g_sinceOut[i], firstItem);
+  resp->print(']');
+  req->send(resp);
+}
+
+// История без std::vector: всё в статических буферах, между файлами — yield().
+// rows[] принимает СНАЧАЛА часовые пачки из liveBuf (новые минуты), затем
+// поверх сдвигаются более старые строки из файлов. Файлы читаются от новых
+// к старым, каждая строка добавляется в начало массива (сдвиг хвоста),
+// поэтому порядок всегда остаётся «старые -> новые».
 static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
+  static HPoint rows[MAX_FILE_ROWS];
   Serial.printf("[MEM] sendHistory: free heap=%u, largest block=%u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-              
+
   int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
 
   int lh, lc;
   liveSnapshot(lh, lc);
   int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
 
-  int      firstPass  = 0;
-  uint32_t oldestLive = 0xFFFFFFFFu;
-  while (firstPass < lc) {
-    uint32_t ts = liveGet((start + firstPass) % MAX_LIVE_POINTS).ts;
-    if (ts != 0 && !(since && ts < since)) {
-      oldestLive = ts;
+  // Часовые пачки минутных средних: все точки свежее `since` (или все, если
+  // since==0 — режим lastN). newestFirst — индекс кольца самой старой принятой
+  // живой точки, oldestLive — её ts.
+  int      newestFirst  = 0;
+  uint32_t oldestLive   = 0xFFFFFFFFu;
+  int      liveInWindow = 0;
+  for (int i = lc - 1; i >= 0; i--) {
+    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
+    if (sp.ts == 0)
+      break; // пустые/несинхронизированные минуты не участвуют
+    if (since && sp.ts < since)
       break;
-    }
-    firstPass++;
+    if (!liveInWindow)
+      newestFirst = i; // самая свежая принятая точка
+    liveInWindow++;
+    oldestLive = sp.ts;
   }
-  int      liveAfter  = lc - firstPass;
-  uint32_t liveNewest = lc ? liveGet((start + lc - 1) % MAX_LIVE_POINTS).ts : 0;
 
-  int need;
-  if (lastN > 0) {
-    need = lastN - liveAfter;
-  } else if (since && oldestLive != 0xFFFFFFFFu) {
-    uint32_t saveSec = saveIntervalMs / 1000UL;
-    if (saveSec < 60)
-      saveSec = 60;
-    uint32_t sec = (oldestLive > since) ? (oldestLive - since) : 0;
-    need         = (int)(sec / saveSec) + 2;
-  } else {
-    need = MAX_FILE_ROWS;
+  int nrow = 0;
+  // Живые минутные точки в конец выхода (самые новые), от старых к новым.
+  if (liveInWindow > maxOut)
+    liveInWindow = maxOut; // защита от переполнения (обычно их 1–5)
+  for (int i = 0; i < liveInWindow; i++) {
+    Point sp     = liveGet((newestFirst - liveInWindow + 1 + i + MAX_LIVE_POINTS * 2) % MAX_LIVE_POINTS);
+    rows[nrow++] = HPoint{sp.ts, sp.t, sp.h, sp.co2};
   }
-  if (need < 0)
-    need = 0;
-  if (need > MAX_FILE_ROWS)
-    need = MAX_FILE_ROWS;
-  std::vector<HPoint> rows;
-  if (need > 0 && fsLock()) {
-    std::vector<String> names;
-    listFiles(LOGS_DIR, names);
-    for (size_t i = 0; i < names.size(); i++)
-      for (size_t j = i + 1; j < names.size(); j++)
-        if (names[j] < names[i])
-          std::swap(names[i], names[j]);
 
-    for (int fi = (int)names.size() - 1; fi >= 0 && (int)rows.size() < need; fi--) {
-      int perFile = need - (int)rows.size();
-      if (perFile > 600)
-        perFile = 600;
-      std::vector<HPoint> tail;
-      readFileTail(names[fi], perFile, tail);
-      if (tail.empty())
-        continue;
-      if (since && tail.back().ts < since)
-        break;
-      std::vector<HPoint> keep;
-      keep.reserve(tail.size());
-      for (const HPoint &p : tail) {
-        if (p.ts == 0 || p.ts >= oldestLive)
+  // Остаток бюджета — строки из файлов (строже: старше oldestLive и свежее since).
+  int budget = (lastN > 0) ? (maxOut - nrow) : (MAX_FILE_ROWS - nrow);
+  if (budget > 0 && fsLock()) {
+    static String names[MAX_LIST_FILES];
+    int nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+    sortNames(names, nf);
+
+    for (int fi = nf - 1; fi >= 0 && nrow < MAX_FILE_ROWS; fi--) {
+      yield();
+      HPoint *tail  = nullptr;
+      int     cnt   = readFileTailStatic(names[fi], MAX_FILE_ROWS, &tail);
+      // строки файла старше живых? берём только ts < oldestLive и ts > since
+      for (int i = cnt - 1; i >= 0; i--) {
+        const HPoint &p = tail[i];
+        if (p.ts == 0)
+          continue;
+        if (p.ts >= oldestLive)
           continue;
         if (since && p.ts < since)
-          continue;
-        keep.push_back(p);
+          break; // файл весь старее окна
+        if (nrow >= MAX_FILE_ROWS)
+          break;
+        // вставляем в начало "файловой" части (перед живыми точками):
+        // сдвигаем хвост на 1 и пишем в позицию (nrow - liveInWindow)
+        int fpos = nrow - liveInWindow; // сколько файловых строк уже есть
+        if (fpos > 0)
+          memmove(rows + 1, rows, sizeof(HPoint) * fpos);
+        rows[0] = p;
+        nrow++;
+        if (lastN > 0 && nrow >= maxOut)
+          break;
       }
-      rows.insert(rows.begin(), keep.begin(), keep.end());
     }
     fsUnlock();
   }
 
-  int liveKeep = liveAfter;
-  int minLive  = maxOut / 3;
-  int room     = maxOut - (int)rows.size();
-  if (room < minLive)
-    room = minLive;
-  if (liveKeep > room)
-    liveKeep = room;
-  int fileBudget = maxOut - liveKeep;
-  if (fileBudget < 1)
-    fileBudget = 1;
-
-  std::vector<HPoint> outv;
-  outv.reserve(maxOut);
-  if (!rows.empty()) {
-    if ((int)rows.size() <= fileBudget) {
-      outv.insert(outv.end(), rows.begin(), rows.end());
-    } else {
-      int step = (int)((rows.size() + fileBudget - 1) / fileBudget);
-      int off  = ((int)rows.size() - 1) % step;
-      for (int i = off; i < (int)rows.size(); i += step)
-        outv.push_back(rows[i]);
-    }
-  }
-  if (liveAfter > 0) {
-    int step = (liveAfter + liveKeep - 1) / liveKeep;
-    if (step < 1)
-      step = 1;
-    int off = (liveAfter - 1) % step;
-    for (int k = off; k < liveAfter; k += step) {
-      Point sp = liveGet((start + firstPass + k) % MAX_LIVE_POINTS);
-      if (sp.ts == 0 || sp.ts < oldestLive || sp.ts > liveNewest)
-        continue;
-      outv.push_back(HPoint{sp.ts, sp.t, sp.h, sp.co2});
-    }
-  }
-
+  // Прореживание до maxOut: каждую HISTORY_STEP-ю точку, всегда сохраняя
+  // последнюю (самую свежую). Живые точки (последние liveInWindow) не режем.
   AsyncResponseStream *resp = req->beginResponseStream("application/json");
   resp->print('[');
   bool firstItem = true;
-  for (const HPoint &p : outv)
-    printPoint(*resp, p, firstItem);
+  int  fileRows  = nrow - liveInWindow;
+  if (fileRows > 0) {
+    int fcap = maxOut - liveInWindow;
+    if (fcap < 1)
+      fcap = 1;
+    int step = 1;
+    if (fileRows > fcap) {
+      step = (fileRows + fcap - 1) / fcap;
+      if (step < HISTORY_STEP)
+        step = HISTORY_STEP;
+    }
+    for (int i = 0; i < fileRows; i += step)
+      printPoint(*resp, rows[i], firstItem);
+  }
+  for (int i = 0; i < liveInWindow; i++) {
+    // если живых больше бюджета — тоже прореживаем, кроме последней
+    if (liveInWindow > maxOut && i % HISTORY_STEP != 0 && i != liveInWindow - 1)
+      continue;
+    printPoint(*resp, rows[fileRows + i], firstItem);
+  }
   resp->print(']');
   req->send(resp);
 }
 
 static String listLogFiles() {
-  String              out = "[";
-  std::vector<String> names;
-  listFiles(LOGS_DIR, names);
+  static String names[MAX_LIST_FILES];
+  String        out = "[";
+  int           nf  = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+  sortNames(names, nf);
 
-  for (size_t i = 0; i < names.size(); i++)
-    for (size_t j = i + 1; j < names.size(); j++)
-      if (names[j] < names[i])
-        std::swap(names[i], names[j]);
-  for (size_t i = 0; i < names.size(); i++) {
+  for (int i = 0; i < nf; i++) {
     int    slash = names[i].lastIndexOf('/');
     String base  = slash >= 0 ? names[i].substring(slash + 1) : names[i];
     if (i)
@@ -745,22 +1097,23 @@ static String listLogFiles() {
   return out;
 }
 
-extern const uint8_t        index_html_start[] asm("_binary_src_index_html_start");
-extern const uint8_t        index_html_end[] asm("_binary_src_index_html_end");
+extern const uint8_t        index_html_start[] asm("_binary_firmware_internal_index_html_start");
+extern const uint8_t        index_html_end[] asm("_binary_firmware_internal_index_html_end");
 static const uint8_t *const INDEX_HTML     = index_html_start;
 static const size_t         INDEX_HTML_LEN = (size_t)(index_html_end - index_html_start);
 
 struct ExportCtx {
-  std::vector<String> names;
-  size_t              idx = 0;
-  File                f;
-  size_t              headerPos = 0;
-  char                pending[168];
-  size_t              pendingLen = 0;
+  String names[MAX_LIST_FILES];
+  int    n = 0;
+  int    idx = 0;
+  File   f;
+  size_t headerPos = 0;
+  char   pending[168];
+  size_t pendingLen = 0;
 };
 
 static bool exportNextLine(ExportCtx &c, char *line, size_t n) {
-  while (c.idx < c.names.size()) {
+  while (c.idx < c.n) {
     if (!c.f) {
       c.f = LittleFS.open(c.names[c.idx], "r");
       if (!c.f) {
@@ -897,6 +1250,20 @@ static void setupWeb() {
     sendHistory(req, since, 0);
   });
 
+  server.on("/api/ext_history", HTTP_GET, [](AsyncWebServerRequest *req) {
+    uint32_t since = 0;
+    if (req->hasParam("since"))
+      since = (uint32_t)strtoul(req->getParam("since")->value().c_str(), nullptr, 10);
+    else {
+      int hours = 24;
+      if (req->hasParam("hours"))
+        hours = req->getParam("hours")->value().toInt();
+      if (hours > 0 && time(nullptr) > 1000000)
+        since = (uint32_t)time(nullptr) - (uint32_t)hours * 3600UL - 60;
+    }
+    sendExtHistory(req, since);
+  });
+
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
     doc["pointSec"]    = pointIntervalMs / 1000;
@@ -938,19 +1305,16 @@ static void setupWeb() {
   });
 
   server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req) {
-    std::vector<String> names;
+    static ExportCtx ctx; // статический — не фрагментируем кучу на каждый экспорт
+    ctx     = ExportCtx();
     if (fsLock(2000)) {
-      listFiles(LOGS_DIR, names);
+      ctx.n = listFiles(LOGS_DIR, ctx.names, MAX_LIST_FILES);
       fsUnlock();
     }
-    for (size_t i = 0; i < names.size(); i++)
-      for (size_t j = i + 1; j < names.size(); j++)
-        if (names[j] < names[i])
-          std::swap(names[i], names[j]);
-    auto ctx   = std::make_shared<ExportCtx>();
-    ctx->names = std::move(names);
-    req->sendChunked("text/csv", [ctx](uint8_t *buf, size_t maxLen, size_t) -> size_t {
-      return exportFill(ctx.get(), buf, maxLen);
+    sortNames(ctx.names, ctx.n);
+    ExportCtx *pc = &ctx;
+    req->sendChunked("text/csv", [pc](uint8_t *buf, size_t maxLen, size_t) -> size_t {
+      return exportFill(pc, buf, maxLen);
     });
   });
 
@@ -1036,23 +1400,18 @@ static void setupWeb() {
       req->send(503, "text/plain", "Файловая система занята, повторите");
       return;
     }
-    std::vector<String> names;
-    listFiles(LOGS_DIR, names);
-    for (size_t i = 0; i < names.size(); i++)
-      for (size_t j = i + 1; j < names.size(); j++)
-        if (names[j] < names[i])
-          std::swap(names[i], names[j]);
+    static String names[MAX_LIST_FILES];
+    int           nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+    sortNames(names, nf);
     const int perPass = 2;
     int       removed = 0;
-    for (auto &n : names) {
-      if (removed >= perPass)
-        break;
-      uint32_t gone = countFileRows(n);
+    for (int i = 0; i < nf && removed < perPass; i++) {
+      uint32_t gone = countFileRows(names[i]);
       logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
-      LittleFS.remove(n);
+      LittleFS.remove(names[i]);
       removed++;
     }
-    int left      = (int)names.size() - removed;
+    int left      = nf - removed;
     oldestSavedTs = (left > 0) ? firstFileTs(names[removed]) : 0;
     fsUnlock();
     if (left > 0) {
@@ -1220,14 +1579,15 @@ void setup() {
   delay(3000);
 
   setupNetwork();
+  setupEspNow();
   setupWeb();
 
   readSensors();
   setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
   lastLogMs   = millis();
   lastPointMs = millis();
-  Serial.printf("[INIT] точка каждые %lu с, сохранение в файл каждые %lu мин\n",
-                pointIntervalMs / 1000, saveIntervalMs / 60000);
+  Serial.printf("[INIT] минутные средние, сохранение на флеш пачками по %lu мин\n",
+                saveIntervalMs / 60000);
   Serial.println("[INIT] готово");
 }
 
@@ -1288,26 +1648,20 @@ void loop() {
 
   netTick();
   startMdns();
+
+  // Опрос датчиков каждые SENSOR_PERIOD_MS и накопление минутных средних.
   static uint32_t lastRead = 0;
-  if (millis() - lastRead > 5000) {
+  if (millis() - lastRead >= SENSOR_PERIOD_MS) {
     lastRead = millis();
     readSensors();
     tryNtp();
+    accumulateMinute();
   }
 
-  if (timeSynced && millis() - lastPointMs >= pointIntervalMs) {
-    lastPointMs = millis();
-    setLatestTs((uint32_t)time(nullptr));
-    if ((dhtOk || mhzOk) && !mhzHeating)
-      pushLivePoint(latest);
-  }
-
-  if (millis() - lastLogMs >= saveIntervalMs) {
-    lastLogMs = millis();
-    setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
-    if ((dhtOk || mhzOk) && !mhzHeating)
-      logReading(latest);
-  }
+  // Запись на флеш — часовой пачкой: как только в часовом буфере набралось
+  // DEFAULT_SAVE_MIN минут (по умолчанию 60), сбрасываем его в файл.
+  if (timeSynced && hourCount >= (int)(saveIntervalMs / 60000UL))
+    flushHourToFlash();
 
   delay(50);
 }

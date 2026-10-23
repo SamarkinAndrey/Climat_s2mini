@@ -825,8 +825,23 @@
         if (v === null) continue;
         if (v < min) min = v; if (v > max) max = v;
       }
-      if (!isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
-      if (min === max) { min -= 1; max += 1; }
+
+      // Ось Y: границы кратны 10 (температура/влажность) или 100 (CO2),
+      // чтобы небольшие колебания выглядели ровнее. При широком разбросе
+      // шаг увеличивается кратно базовому, чтобы подписи не слипались.
+      const baseStep = isCo2 ? 100 : 10;
+      if (!isFinite(min) || !isFinite(max)) { min = 0; max = baseStep; }
+      const niceMults = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+      let step = baseStep;
+      for (const m of niceMults) {
+        step = baseStep * m;
+        const lo = Math.floor(min / step) * step;
+        const hi = Math.ceil(max / step) * step;
+        if ((hi - lo) / step <= 8) { min = lo; max = hi; break; }
+      }
+      if (min === max) max = min + baseStep;
+      const ticks = [];
+      for (let v = min; v <= max + step * 0.001; v += step) ticks.push(v);
       const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
 
       // ---- шкала значений: отдельный canvas, не уезжает при прокрутке ----
@@ -838,18 +853,17 @@
         const a = ay.getContext('2d');
         a.setTransform(dpr, 0, 0, dpr, 0, 0); a.clearRect(0, 0, AXIS_W, h);
         a.fillStyle = '#94a3b8'; a.font = '11px sans-serif'; a.textAlign = 'right';
-        for (let i = 0; i <= 4; i++) {
-          const y = pad.t + ph * i / 4;
-          const v = max - (max - min) * i / 4;
-          a.fillText(v.toFixed(1), AXIS_W - 4, y + 4);
+        for (const v of ticks) {
+          const y = pad.t + ph * (1 - (v - min) / (max - min));
+          a.fillText(v.toFixed(0), AXIS_W - 4, y + 4);
         }
         a.textAlign = 'left';
       }
 
       // ---- сетка: горизонтальные линии + значения (на шкале) ----
       g.lineWidth = 1; g.strokeStyle = '#334155'; g.font = '11px sans-serif';
-      for (let i = 0; i <= 4; i++) {
-        const y = pad.t + ph * i / 4;
+      for (const v of ticks) {
+        const y = pad.t + ph * (1 - (v - min) / (max - min));
         g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
       }
       if (data.length) {

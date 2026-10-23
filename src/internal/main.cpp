@@ -28,13 +28,10 @@
 #define SENSOR_PERIOD_MS   5000UL
 #define DEFAULT_POINT_SEC  60
 #define DEFAULT_SAVE_MIN   60
-#define MIN_POINT_SEC      5
-#define MAX_POINT_SEC      600
 #define MIN_SAVE_MIN       10
-#define MAX_SAVE_MIN       1440
-#define MAX_LIVE_POINTS    720
+#define MAX_SAVE_MIN       60     // часовой буфер вмещает 60 минут — больше нельзя
+#define MAX_LIVE_POINTS    1440   // сутки минутных средних в ОЗУ
 #define MAX_HISTORY_OUT    300
-#define MAX_FILE_ROWS      500
 #define HISTORY_STEP       5
 #define SAMPLES_PER_MIN    12
 #define FRONT_CAP_PERIOD   400
@@ -100,7 +97,6 @@ uint32_t lastPointMs     = 0;
 uint16_t accN            = 0; // тиков накопления в текущую минуту (из 12)
 bool     apMode          = true;
 bool     timeSynced      = false;
-uint32_t pointIntervalMs = DEFAULT_POINT_SEC * 1000UL;
 uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL;
 uint32_t pointsSeq       = 0;
 uint32_t logRowsTotal    = 0;
@@ -131,7 +127,7 @@ struct SensorPacket {
 };
 
 #define EXT_MAGIC   0x434C4931UL
-#define MAX_EXT_PTS 720 // ~сутки минутных средних внешнего блока
+#define MAX_EXT_PTS 720 // 12 часов минутных средних внешнего блока
 
 struct ExtAvg {
   float    t, h, p, b;
@@ -232,6 +228,15 @@ static void sortNames(String *names, int n) {
         std::swap(names[i], names[j]);
 }
 
+// Файлы внешнего блока (/logs/ext_*.csv) имеют другую схему:
+// timestamp,datetime,temperature,humidity,pressure,batt
+// Их нельзя смешивать с основными (5 колонок) — иначе давление попадёт в CO2.
+static bool isExtLogFile(const String &path) {
+  int slash = path.lastIndexOf('/');
+  String base = (slash >= 0) ? path.substring(slash + 1) : path;
+  return base.startsWith("ext_");
+}
+
 static uint32_t countFileRows(const String &path) {
   File f = LittleFS.open(path, "r");
   if (!f)
@@ -274,20 +279,29 @@ static void recountLogRows() {
   static String names[MAX_LIST_FILES];
   int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
   uint32_t total = 0;
-  for (int i = 0; i < n; i++)
+  int      main  = 0;
+  for (int i = 0; i < n; i++) {
+    if (isExtLogFile(names[i]))
+      continue; // строки внешнего блока считаются отдельно
     total += countFileRows(names[i]);
+    main++;
+  }
   logRowsTotal = total;
 
   oldestSavedTs = 0;
-  if (n > 0) {
-    int oi = 0;
-    for (int i = 1; i < n; i++)
-      if (names[i] < names[oi])
+  if (main > 0) {
+    int oi = -1;
+    for (int i = 0; i < n; i++) {
+      if (isExtLogFile(names[i]))
+        continue;
+      if (oi < 0 || names[i] < names[oi])
         oi = i;
-    oldestSavedTs = firstFileTs(names[oi]);
+    }
+    if (oi >= 0)
+      oldestSavedTs = firstFileTs(names[oi]);
   }
-  Serial.printf("[LOG] файлов %u, записей всего %lu, самая ранняя %lu\n",
-                (unsigned)n, (unsigned long)total, (unsigned long)oldestSavedTs);
+  Serial.printf("[LOG] файлов %u (основных %d), записей всего %lu, самая ранняя %lu\n",
+                (unsigned)n, main, (unsigned long)total, (unsigned long)oldestSavedTs);
 }
 
 static void rotateLogsIfNeeded() {
@@ -335,39 +349,8 @@ static String extTodayFile() {
   return String(name);
 }
 
-static void logReading(const Reading &r) {
-  if (!timeSynced || (time(nullptr) < 1000000)) {
-    Serial.println("[LOG] время не синхронизировано (NTP), пропускаю запись в файл");
-    return;
-  }
-  if (!fsLock(300)) {
-    Serial.println("[LOG] ФС занята, запись пропущена");
-    return;
-  }
-  if (!LittleFS.exists(LOGS_DIR))
-    LittleFS.mkdir(LOGS_DIR);
-  String path  = todayFile();
-  bool   isNew = !LittleFS.exists(path);
-
-  File f = LittleFS.open(path, "a");
-  if (!f) {
-    Serial.println("[LOG] ошибка открытия файла");
-    fsUnlock();
-    return;
-  }
-  if (isNew)
-    f.println("timestamp,datetime,temperature,humidity,co2");
-  f.printf("%lu,%s,%.2f,%.2f,%u\n", r.timestamp, fmtTime(r.timestamp).c_str(),
-           r.temperature, r.humidity, r.co2);
-  f.close();
-  logRowsTotal++;
-  pointsSeq++;
-  Serial.printf("[LOG] записано в %s: %.1fC %.1f%% %uppm\n",
-                path.c_str(), r.temperature, r.humidity, r.co2);
-  rotateLogsIfNeeded();
-  fsUnlock();
-}
-
+// Запись отдельного «сырого» замера в файл больше не используется:
+// в файлы попадают только минутные средние (flushHourToFlash).
 static void pushLivePoint(const Reading &r) {
   portENTER_CRITICAL(&liveMux);
   Point &p = liveBuf[liveHead];
@@ -424,7 +407,10 @@ static ExtAvg extGet(int idx) {
 }
 
 // ---------- ESP-NOW: приём пакетов внешнего блока ----------
-static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+// Сигнатура под Arduino-ESP32 core 2.x (esp_now_recv_cb_t): mac, data, len.
+// В core 3.x первым аргументом приходит esp_now_recv_info_t* — см. аудит.
+static void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  (void)mac;
   if (len != sizeof(SensorPacket))
     return;
   SensorPacket pkt;
@@ -441,13 +427,16 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
   portENTER_CRITICAL(&extMux);
   extSeen     = true;
   extLastRxMs = millis();
-  portEXIT_CRITICAL(&extMux);
-
+  // Накопление внешних измерений защищено той же блокировкой, что и кольцо
+  // extBuf: колбэк ESP-NOW живёт в задаче Wi-Fi и раньше писал в accExt
+  // без синхронизации с accumulateMinute() — это была гонка по float.
   accExt.t += pkt.temp;
   accExt.h += pkt.hum;
   accExt.p += pkt.press;
   accExt.b += pkt.batt;
   accExt.nExt++;
+  portEXIT_CRITICAL(&extMux);
+  (void)ts;
 }
 
 static void setupEspNow() {
@@ -584,13 +573,19 @@ static void accumulateMinute() {
     accIn.nCo2++;
   }
 
-  // внешний блок считаем живым, если пакет был за последние 15 минут
-  bool extAlive;
+  // внешний блок считаем живым, если пакет был за последние 15 минут.
+  // Снимок накопителя берём под блокировкой — колбэк ESP-NOW пишет в accExt
+  // из задачи Wi-Fi, здесь же он читается и обнуляется.
+  bool   extAlive;
+  MinAcc extAcc;
   portENTER_CRITICAL(&extMux);
   extAlive = extSeen && (millis() - extLastRxMs < 15UL * 60UL * 1000UL);
-  portEXIT_CRITICAL(&extMux);
-  if (!extAlive)
+  extAcc   = accExt;
+  if (!extAlive) {
     accExt.nExt = 0;
+    accExt.t = accExt.h = accExt.p = accExt.b = 0;
+  }
+  portEXIT_CRITICAL(&extMux);
 
   if (++accN < SAMPLES_PER_MIN)
     return;
@@ -616,15 +611,23 @@ static void accumulateMinute() {
       hourBuf[hourCount].co2 = avgCo2;
       hourBuf[hourCount].ts  = ts;
       hourCount++;
+    } else {
+      // буфер переполнен (предыдущий сброс не удался) — данные не пишем,
+      // но сообщаем, чтобы не терять их молча
+      static uint32_t lastOverflowWarn = 0;
+      if (millis() - lastOverflowWarn > 60000UL) {
+        lastOverflowWarn = millis();
+        Serial.println("[LOG] буфер часа переполнен — минуты теряются (ФС занята?)");
+      }
     }
   }
 
-  if (accExt.nExt) {
+  if (extAcc.nExt) {
     ExtAvg ea;
-    ea.t  = accExt.t / accExt.nExt;
-    ea.h  = accExt.h / accExt.nExt;
-    ea.p  = accExt.p / accExt.nExt;
-    ea.b  = accExt.b / accExt.nExt;
+    ea.t  = extAcc.t / extAcc.nExt;
+    ea.h  = extAcc.h / extAcc.nExt;
+    ea.p  = extAcc.p / extAcc.nExt;
+    ea.b  = extAcc.b / extAcc.nExt;
     ea.ts = ts;
     pushExtAvg(ea);
     if (extHourCount < 60) {
@@ -633,9 +636,11 @@ static void accumulateMinute() {
     }
   }
 
-  accIn  = MinAcc();
+  accIn = MinAcc();
+  accN  = 0;
+  portENTER_CRITICAL(&extMux);
   accExt = MinAcc();
-  accN   = 0;
+  portEXIT_CRITICAL(&extMux);
 }
 
 // Запись часовой пачки минутных средних на флеш (ресурс ФС: ~9 строк/сутки).
@@ -710,10 +715,15 @@ static void tryNtp() {
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     setLatestTs((uint32_t)tt);
-    if (!mhzHeating) {
-      logReading(latest);
-      pushLivePoint(latest);
-    }
+    // До синхронизации минутные средние накапливались с ts=0 — в файлы такие
+    // строки попадать не должны. Сбрасываем накопленное и начинаем заново.
+    accIn       = MinAcc();
+    accN        = 0;
+    hourCount   = 0;
+    extHourCount = 0;
+    portENTER_CRITICAL(&extMux);
+    accExt = MinAcc();
+    portEXIT_CRITICAL(&extMux);
     lastLogMs   = millis();
     lastPointMs = millis();
   }
@@ -764,7 +774,7 @@ static size_t jsonCurrent(char *buf, size_t n) {
       nextIn = (saveIntervalMs - elapsed) / 1000;
   }
   doc["nextLogInSec"] = nextIn;
-  doc["pointSec"]     = pointIntervalMs / 1000;
+  doc["pointSec"]     = DEFAULT_POINT_SEC;
   doc["saveMin"]      = saveIntervalMs / 60000;
   doc["frontCap"]     = FRONT_CAP_PERIOD;
   doc["capPeriod"]    = FRONT_CAP_PERIOD;
@@ -834,30 +844,82 @@ struct HPoint {
   uint16_t co2;
 };
 
-// Читает последние maxRows строк файла в статическое кольцо и возвращает их
-// количество; out указывает на g_rows (не использовать повторно до конца запроса).
-static HPoint g_rows[MAX_FILE_ROWS];
-static HPoint g_ring[MAX_FILE_ROWS];
-
-static int readFileTailStatic(const String &path, int maxRows, HPoint **out) {
-  if (maxRows < 1)
-    maxRows = 1;
-  if (maxRows > MAX_FILE_ROWS)
-    maxRows = MAX_FILE_ROWS;
+// Читает точки CSV-файла в диапазоне [tsFrom, tsUntil) и оставляет только
+// те, что проходят прореживание по интервалу (между оставленными не меньше
+// step минут). Кладёт точки в out (не больше maxOut) и возвращает их количество.
+// Файл читается не целиком: по первой строке оценивается смещение по времени
+// и делается seek — так в память и на диск попадает только нужный кусок.
+static int readFileRange(const String &path, uint32_t tsFrom, uint32_t tsUntil,
+                         int step, HPoint *out, int maxOut) {
+  if (maxOut <= 0)
+    return 0;
+  yield();
   File f = LittleFS.open(path, "r");
-  if (!f) {
-    *out = g_rows;
+  if (!f)
+    return 0;
+
+  char   line[160];
+  size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+  if (n == 0) { // пустой файл / без заголовка
+    f.close();
+    return 0;
+  }
+  size_t dataStart = f.position(); // начало первой строки данных
+  n                = f.readBytesUntil('\n', line, sizeof(line) - 1);
+  if (n == 0) {
+    f.close();
+    return 0;
+  }
+  line[n] = 0;
+  uint32_t firstTs = (uint32_t)strtoul(line, nullptr, 10);
+  if (firstTs == 0) {
+    f.close();
     return 0;
   }
 
-  int   cnt = 0, head = 0;
-  char  line[128];
+  const size_t ROW_HINT = 40; // заниженная оценка длины строки CSV: лучше перечитать
+  const uint32_t from    = tsFrom;
+  if (from <= firstTs) {
+    f.seek(dataStart);
+  } else {
+    // примерное смещение: (минут) * (средняя длина строки)
+    size_t est = (size_t)(((uint64_t)(from - firstTs) / 60UL) * ROW_HINT);
+    size_t off = dataStart + est;
+    size_t sz  = f.size();
+    if (off > sz)
+      off = sz;
+    f.seek(off);
+    // строка после отмотки может быть обрезанной — выравниваемся по концу строки
+    if (!f.readBytesUntil('\n', line, sizeof(line) - 1)) {
+      f.close();
+      return 0;
+    }
+  }
+
+  int cnt = 0;
+  uint32_t lastKeptTs = 0;
+  bool     haveLast   = false;
+  int readRows = 0;
   while (f.available()) {
-    size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+    n = f.readBytesUntil('\n', line, sizeof(line) - 1);
     if (n == 0)
       break;
     line[n] = 0;
-    if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
+    readRows++;
+    if (readRows % 32 == 0)
+      yield();
+    uint32_t ts = (uint32_t)strtoul(line, nullptr, 10);
+    if (ts == 0)
+      continue;
+    if (ts < from)
+      continue;
+    if (tsUntil && ts >= tsUntil)
+      break; // дальше уже только живой буфер
+    // Прореживание по интервалу, а не по фазе эпохи: точки на флеш лежат на
+    // своей сетке (у старых записей — 5 мин, у новых — 1 мин), поэтому
+    // проверка (ts/60)%step отсекала бы их все. Здесь оставляем точку, только
+    // если с предыдущей оставленной прошло не меньше step минут.
+    if (step > 1 && haveLast && (uint32_t)(ts - lastKeptTs) < (uint32_t)step * 60UL)
       continue;
     char *c1 = strchr(line, ',');
     if (!c1)
@@ -868,28 +930,20 @@ static int readFileTailStatic(const String &path, int maxRows, HPoint **out) {
     char *c3 = strchr(c2 + 1, ',');
     if (!c3)
       continue;
-    char *c4 = strchr(c3 + 1, ',');
+    char *c4 = strchr(c3 + 1, ','); // всё после — CO2
     if (!c4)
       continue;
-    uint32_t ts = (uint32_t)strtoul(line, nullptr, 10);
-    if (ts == 0)
-      continue;
-    HPoint &p = g_ring[head];
-    p.ts      = ts;
-    p.t       = atof(c2 + 1);
-    p.h       = atof(c3 + 1);
-    p.co2     = (uint16_t)atoi(c4 + 1);
-    head      = (head + 1) % maxRows;
-    if (cnt < maxRows)
-      cnt++;
+    out[cnt].ts  = ts;
+    out[cnt].t   = atof(c2 + 1);
+    out[cnt].h   = atof(c3 + 1);
+    out[cnt].co2 = (uint16_t)atoi(c4 + 1);
+    cnt++;
+    lastKeptTs = ts;
+    haveLast   = true;
+    if (cnt >= maxOut)
+      break;
   }
   f.close();
-
-  // разворачиваем кольцо в линейный порядок (старые -> новые)
-  int start = (head - cnt + maxRows) % maxRows;
-  for (int i = 0; i < cnt; i++)
-    g_rows[i] = g_ring[(start + i) % maxRows];
-  *out = g_rows;
   return cnt;
 }
 
@@ -972,110 +1026,182 @@ static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
   req->send(resp);
 }
 
+// ---------- Сборка истории /api/history ----------
+// Источники: файлы (старые точки) + кольцо liveBuf (минутные средние).
+// Ответ всегда «старые -> новые», объём не больше maxOut.
+// Прореживание — ПО ИНТЕРВАЛУ: между двумя оставленными точками не меньше
+// step минут. Так файловая часть покрывает весь запрошенный период (а не
+// только последние N строк), а в буфер попадает не больше maxOut точек —
+// статической RAM на ESP32-S2 мало, лишние килобайты уходят за предел DRAM.
+// Один общий буфер: в него попадают только файловые строки.
+static HPoint g_histBuf[MAX_HISTORY_OUT + 16];
+
+// Собирает файловые строки (старые -> новые) в g_histBuf.
+// Файлы обходятся от старых к новых, поэтому порядок в буфере сразу правильный.
+// Попадают только точки из окна [tsFrom, oldestLive), прореженные по интервалу
+// (между оставленными — не меньше step минут). Интервальное прореживание не
+// зависит от фазы сетки данных: старые записи на флеш лежат с шагом 5 мин,
+// новые — с шагом 1 мин, и привязка к (ts/60)%step отсекала бы их целиком.
+static int collectFileRows(const String *names, int nf, uint32_t oldestLive,
+                           uint32_t tsFrom, int step) {
+  const int CAP = (int)(sizeof(g_histBuf) / sizeof(g_histBuf[0]));
+  int       fn  = 0;
+  uint32_t now = time(nullptr);
+  int       start = 0;
+  if (nf > 3 && tsFrom > 0 && now > 1000000) {
+    if ((now - tsFrom) > 12UL * 3600UL) {
+      start = nf - 2;
+      if (start < 0) start = 0;
+    } else if ((now - tsFrom) > 30UL * 3600UL) {
+      start = nf - 3;
+      if (start < 0) start = 0;
+    }
+  }
+  for (int i = start; i < nf; i++) {
+    yield();
+    if (isExtLogFile(names[i]))
+      continue;
+    uint32_t fileFirst = firstFileTs(names[i]);
+    if (!fileFirst)
+      continue;
+    uint32_t from = tsFrom;
+    if (!from || from < fileFirst)
+      from = fileFirst;
+    if (oldestLive && from >= oldestLive)
+      continue;
+    int got = readFileRange(names[i], from, oldestLive, step, g_histBuf + fn, CAP - fn);
+    fn += got;
+    if (fn >= CAP)
+      break;
+  }
+  return fn;
+}
+
 // История без std::vector: всё в статических буферах, между файлами — yield().
-// rows[] принимает СНАЧАЛА часовые пачки из liveBuf (новые минуты), затем
-// поверх сдвигаются более старые строки из файлов. Файлы читаются от новых
-// к старым, каждая строка добавляется в начало массива (сдвиг хвоста),
-// поэтому порядок всегда остаётся «старые -> новые».
 static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
-  static HPoint rows[MAX_FILE_ROWS];
   Serial.printf("[MEM] sendHistory: free heap=%u, largest block=%u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
+  const int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
 
+  // ---- 1. окно живых минутных средних ----
   int lh, lc;
   liveSnapshot(lh, lc);
-  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  const int ringStart = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
 
-  // Часовые пачки минутных средних: все точки свежее `since` (или все, если
-  // since==0 — режим lastN). newestFirst — индекс кольца самой старой принятой
-  // живой точки, oldestLive — её ts.
-  int      newestFirst  = 0;
-  uint32_t oldestLive   = 0xFFFFFFFFu;
-  int      liveInWindow = 0;
+  int      newestFirst = 0;
+  uint32_t oldestLive  = 0xFFFFFFFFu;
+  int      L           = 0;
   for (int i = lc - 1; i >= 0; i--) {
-    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
+    Point sp = liveGet((ringStart + i) % MAX_LIVE_POINTS);
     if (sp.ts == 0)
-      break; // пустые/несинхронизированные минуты не участвуют
+      break; // минуты без времени (до NTP) не участвуют
     if (since && sp.ts < since)
       break;
-    if (!liveInWindow)
+    if (!L)
       newestFirst = i; // самая свежая принятая точка
-    liveInWindow++;
+    L++;
     oldestLive = sp.ts;
   }
+  // индекс кольца самой старой принятой живой точки
+  const int liveBegin = (ringStart + newestFirst - L + 1 + MAX_LIVE_POINTS * 2) % MAX_LIVE_POINTS;
 
-  int nrow = 0;
-  // Живые минутные точки в конец выхода (самые новые), от старых к новым.
-  if (liveInWindow > maxOut)
-    liveInWindow = maxOut; // защита от переполнения (обычно их 1–5)
-  for (int i = 0; i < liveInWindow; i++) {
-    Point sp     = liveGet((newestFirst - liveInWindow + 1 + i + MAX_LIVE_POINTS * 2) % MAX_LIVE_POINTS);
-    rows[nrow++] = HPoint{sp.ts, sp.t, sp.h, sp.co2};
-  }
-
-  // Остаток бюджета — строки из файлов (строже: старше oldestLive и свежее since).
-  int budget = (lastN > 0) ? (maxOut - nrow) : (MAX_FILE_ROWS - nrow);
-  if (budget > 0 && fsLock()) {
-    static String names[MAX_LIST_FILES];
-    int nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+  // ---- 2. список файлов ----
+  static String names[MAX_LIST_FILES];
+  int nf = 0;
+  if (fsLock()) {
+    nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
     sortNames(names, nf);
-
-    for (int fi = nf - 1; fi >= 0 && nrow < MAX_FILE_ROWS; fi--) {
-      yield();
-      HPoint *tail  = nullptr;
-      int     cnt   = readFileTailStatic(names[fi], MAX_FILE_ROWS, &tail);
-      // строки файла старше живых? берём только ts < oldestLive и ts > since
-      for (int i = cnt - 1; i >= 0; i--) {
-        const HPoint &p = tail[i];
-        if (p.ts == 0)
-          continue;
-        if (p.ts >= oldestLive)
-          continue;
-        if (since && p.ts < since)
-          break; // файл весь старее окна
-        if (nrow >= MAX_FILE_ROWS)
-          break;
-        // вставляем в начало "файловой" части (перед живыми точками):
-        // сдвигаем хвост на 1 и пишем в позицию (nrow - liveInWindow)
-        int fpos = nrow - liveInWindow; // сколько файловых строк уже есть
-        if (fpos > 0)
-          memmove(rows + 1, rows, sizeof(HPoint) * fpos);
-        rows[0] = p;
-        nrow++;
-        if (lastN > 0 && nrow >= maxOut)
-          break;
-      }
-    }
     fsUnlock();
   }
+  // начало доступного диапазона — самый старый основной файл
+  uint32_t fileFirst = 0;
+  for (int i = 0; i < nf; i++) {
+    if (isExtLogFile(names[i]))
+      continue;
+    fileFirst = firstFileTs(names[i]);
+    break; // names отсортированы, первый основной файл — самый старый
+  }
+  if (fileFirst && since && fileFirst < since)
+    fileFirst = since;
 
-  // Прореживание до maxOut: каждую HISTORY_STEP-ю точку, всегда сохраняя
-  // последнюю (самую свежую). Живые точки (последние liveInWindow) не режем.
+  // ---- 3. шаг прореживания по общему охвату времени ----
+  uint32_t spanEnd   = 0;
+  uint32_t spanStart = 0;
+  if (L > 0) {
+    spanEnd   = liveGet((liveBegin + L - 1) % MAX_LIVE_POINTS).ts;
+    spanStart = oldestLive;
+  }
+  if (!spanEnd && timeSynced)
+    spanEnd = (uint32_t)time(nullptr);
+  if (fileFirst && (!spanStart || fileFirst < spanStart))
+    spanStart = fileFirst;
+  if (!spanStart)
+    spanStart = since ? since : spanEnd;
+
+  int step = 1;
+  if (lastN <= 0) {
+    int spanMin = (spanEnd > spanStart) ? (int)((spanEnd - spanStart) / 60) : 0;
+    step = HISTORY_STEP;
+    while (step < 1440 && (spanMin + step - 1) / step + 2 > maxOut)
+      step++;
+  } else {
+    // points=N — последние N минут данных: окно считаем от самой свежей точки,
+    // прореживание не нужно (точек в окне и так немного). Так возвращаются
+    // именно последние записи, а не первые N из буфера.
+    if (spanEnd > (uint32_t)lastN * 60UL) {
+      uint32_t winStart = spanEnd - (uint32_t)lastN * 60UL;
+      if (!since || winStart > since)
+        since = winStart;
+    }
+    step = 1;
+  }
+
+  // ---- 4. файловые строки (старше живых) ----
+  int F = 0;
+  bool scanFiles = timeSynced && ESP.getFreeHeap() > 95000;
+  if (scanFiles) {
+    F = collectFileRows(names, nf, oldestLive, since, step);
+  }
+
+  // ---- 5. выбор точек ----
+  int fFrom = 0, fCount = F;
+  int lFrom = 0, lCount = L;
+  if (lastN > 0) {
+    // points=N — последние N точек без прореживания (живые всегда свежее файловых)
+    lCount = (L < maxOut) ? L : maxOut;
+    fCount = maxOut - lCount;
+    if (fCount > F) {
+      fCount = F;
+      lCount = (L < (maxOut - fCount)) ? L : (maxOut - fCount);
+    }
+    lFrom = L - lCount;
+    fFrom = F - fCount;
+  }
+
+  // ---- 6. вывод: сначала файловые (старые), затем живые (новые) ----
   AsyncResponseStream *resp = req->beginResponseStream("application/json");
   resp->print('[');
   bool firstItem = true;
-  int  fileRows  = nrow - liveInWindow;
-  if (fileRows > 0) {
-    int fcap = maxOut - liveInWindow;
-    if (fcap < 1)
-      fcap = 1;
-    int step = 1;
-    if (fileRows > fcap) {
-      step = (fileRows + fcap - 1) / fcap;
-      if (step < HISTORY_STEP)
-        step = HISTORY_STEP;
-    }
-    for (int i = 0; i < fileRows; i += step)
-      printPoint(*resp, rows[i], firstItem);
-  }
-  for (int i = 0; i < liveInWindow; i++) {
-    // если живых больше бюджета — тоже прореживаем, кроме последней
-    if (liveInWindow > maxOut && i % HISTORY_STEP != 0 && i != liveInWindow - 1)
+
+  for (int i = 0; i < fCount; i++)
+    printPoint(*resp, g_histBuf[fFrom + i], firstItem);
+
+  uint32_t lastKeptLive = 0;
+  bool     haveLastLive  = false;
+  for (int i = 0; i < lCount; i++) {
+    Point sp = liveGet((liveBegin + lFrom + i) % MAX_LIVE_POINTS);
+    // прореживание по интервалу (как в файлах) + всегда самая свежая точка
+    bool keep = (step <= 1) || !haveLastLive ||
+                ((uint32_t)(sp.ts - lastKeptLive) >= (uint32_t)step * 60UL) ||
+                (i == lCount - 1);
+    if (!keep)
       continue;
-    printPoint(*resp, rows[fileRows + i], firstItem);
+    printPoint(*resp, HPoint{sp.ts, sp.t, sp.h, sp.co2}, firstItem);
+    lastKeptLive = sp.ts;
+    haveLastLive  = true;
   }
+
   resp->print(']');
   req->send(resp);
 }
@@ -1097,8 +1223,8 @@ static String listLogFiles() {
   return out;
 }
 
-extern const uint8_t        index_html_start[] asm("_binary_firmware_internal_index_html_start");
-extern const uint8_t        index_html_end[] asm("_binary_firmware_internal_index_html_end");
+extern const uint8_t        index_html_start[] asm("_binary_src_internal_index_html_start");
+extern const uint8_t        index_html_end[] asm("_binary_src_internal_index_html_end");
 static const uint8_t *const INDEX_HTML     = index_html_start;
 static const size_t         INDEX_HTML_LEN = (size_t)(index_html_end - index_html_start);
 
@@ -1220,8 +1346,10 @@ static void setupWeb() {
   });
 
   server.on("/api/current", HTTP_GET, [](AsyncWebServerRequest *req) {
-    char buf[768];
-    jsonCurrent(buf, sizeof(buf));
+    char buf[1024];
+    size_t n = jsonCurrent(buf, sizeof(buf));
+    if (n == 0 || (size_t)n >= sizeof(buf))
+      Serial.println("[API] /api/current: ответ не влез в буфер");
     req->send(200, "application/json", buf);
   });
 
@@ -1241,10 +1369,14 @@ static void setupWeb() {
 
     int hours = 12;
     if (req->hasParam("hours"))
-      hours = req->getParam("hours")->value().toInt();
+      hours = constrain(req->getParam("hours")->value().toInt(), 1, 24);
+    if (hours >= 18) hours = 12;
     uint32_t since = 0;
-    if (hours > 0 && time(nullptr) > 1000000)
+    if (time(nullptr) > 1000000) {
       since = (uint32_t)time(nullptr) - (uint32_t)hours * 3600UL;
+    } else {
+      since = 0;
+    }
     Serial.printf("[MEM] /api/history: период %d ч (since=%lu), heap=%u\n",
                   hours, (unsigned long)since, (unsigned)ESP.getFreeHeap());
     sendHistory(req, since, 0);
@@ -1266,10 +1398,12 @@ static void setupWeb() {
 
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    doc["pointSec"]    = pointIntervalMs / 1000;
+    // Период точки фиксирован: точки — минутные средние (12 замеров по 5 с).
+    // Значение отдаётся для совместимости со старой вкладкой настроек.
+    doc["pointSec"]    = DEFAULT_POINT_SEC;
     doc["saveMin"]     = saveIntervalMs / 60000;
-    doc["minPointSec"] = MIN_POINT_SEC;
-    doc["maxPointSec"] = MAX_POINT_SEC;
+    doc["minPointSec"] = DEFAULT_POINT_SEC;
+    doc["maxPointSec"] = DEFAULT_POINT_SEC;
     doc["minSaveMin"]  = MIN_SAVE_MIN;
     doc["maxSaveMin"]  = MAX_SAVE_MIN;
     String out;
@@ -1279,10 +1413,8 @@ static void setupWeb() {
 
   server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *req) {
     if (req->hasParam("pointSec", true)) {
-      int v           = req->getParam("pointSec", true)->value().toInt();
-      v               = constrain(v, MIN_POINT_SEC, MAX_POINT_SEC);
-      pointIntervalMs = (uint32_t)v * 1000UL;
-      prefs.putUInt("psec", (uint32_t)v);
+      // Период точки больше не настраивается: точки — минутные средние.
+      Serial.println("[CFG] период точки фиксирован (60 с), параметр проигнорирован");
     }
     if (req->hasParam("saveMin", true)) {
       int v          = req->getParam("saveMin", true)->value().toInt();
@@ -1290,8 +1422,8 @@ static void setupWeb() {
       saveIntervalMs = (uint32_t)v * 60000UL;
       prefs.putUInt("smin", (uint32_t)v);
     }
-    Serial.printf("[CFG] период точки: %lu с, сохранение: %lu мин\n",
-                  pointIntervalMs / 1000, saveIntervalMs / 60000);
+    Serial.printf("[CFG] точка: фиксированно %d с, сохранение: %lu мин\n",
+                  DEFAULT_POINT_SEC, saveIntervalMs / 60000);
     req->send(200, "text/plain", "Сохранено");
   });
 
@@ -1311,6 +1443,15 @@ static void setupWeb() {
       ctx.n = listFiles(LOGS_DIR, ctx.names, MAX_LIST_FILES);
       fsUnlock();
     }
+    // Экспорт основной таблицы (5 колонок). Файлы внешнего блока (6 колонок,
+    // другая схема) сюда не попадают — иначе давление уедет в колонку CO2.
+    int w = 0;
+    for (int i = 0; i < ctx.n; i++) {
+      if (isExtLogFile(ctx.names[i]))
+        continue;
+      ctx.names[w++] = ctx.names[i];
+    }
+    ctx.n = w;
     sortNames(ctx.names, ctx.n);
     ExportCtx *pc = &ctx;
     req->sendChunked("text/csv", [pc](uint8_t *buf, size_t maxLen, size_t) -> size_t {
@@ -1546,13 +1687,11 @@ void setup() {
   prefs.begin("cfg", false);
 
   {
-    uint32_t ps = prefs.getUInt("psec", DEFAULT_POINT_SEC);
+    // Период точки фиксирован (минутные средние), настройка только периода
+    // сохранения в файл. Старое значение "psec" в NVS игнорируем.
     uint32_t sm = prefs.getUInt("smin", DEFAULT_SAVE_MIN);
-    if (ps < MIN_POINT_SEC || ps > MAX_POINT_SEC)
-      ps = DEFAULT_POINT_SEC;
     if (sm < MIN_SAVE_MIN || sm > MAX_SAVE_MIN)
       sm = DEFAULT_SAVE_MIN;
-    pointIntervalMs = ps * 1000UL;
     saveIntervalMs  = sm * 60000UL;
   }
 

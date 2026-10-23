@@ -187,6 +187,31 @@
       margin-top: 10px
     }
 
+    /* График: слева неподвижная шкала значений, справа — прокручиваемый
+       холст (canvas шире экрана в 4 раза: видно 6 ч, прокруткой до 24 ч). */
+    .chartwrap {
+      display: flex;
+      align-items: stretch
+    }
+
+    .chartwrap .cay {
+      flex: 0 0 44px;
+      width: 44px;
+      display: block
+    }
+
+    .chart-scroll {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch
+    }
+
+    .chart-scroll canvas {
+      display: block
+    }
+
     .prow {
       display: flex;
       align-items: center;
@@ -442,7 +467,12 @@
           <span class="mval" id="v-t">—</span>
           <span class="marrow" id="ar-t">▸</span>
         </div>
-        <div class="mchart" id="c-t" style="display:none"><canvas id="ch-t"></canvas></div>
+        <div class="mchart" id="c-t" style="display:none">
+          <div class="chartwrap">
+            <canvas class="cay" id="cy-t"></canvas>
+            <div class="chart-scroll" id="cs-t"><canvas id="ch-t"></canvas></div>
+          </div>
+        </div>
       </div>
 
       <div class="panel metric">
@@ -451,7 +481,12 @@
           <span class="mval" id="v-h">—</span>
           <span class="marrow" id="ar-h">▸</span>
         </div>
-        <div class="mchart" id="c-h" style="display:none"><canvas id="ch-h"></canvas></div>
+        <div class="mchart" id="c-h" style="display:none">
+          <div class="chartwrap">
+            <canvas class="cay" id="cy-h"></canvas>
+            <div class="chart-scroll" id="cs-h"><canvas id="ch-h"></canvas></div>
+          </div>
+        </div>
       </div>
 
       <div class="panel metric">
@@ -460,21 +495,17 @@
           <span class="mval" id="v-co2">—</span>
           <span class="marrow" id="ar-co2">▸</span>
         </div>
-        <div class="mchart" id="c-co2" style="display:none"><canvas id="ch-co2"></canvas></div>
+        <div class="mchart" id="c-co2" style="display:none">
+          <div class="chartwrap">
+            <canvas class="cay" id="cy-co2"></canvas>
+            <div class="chart-scroll" id="cs-co2"><canvas id="ch-co2"></canvas></div>
+          </div>
+        </div>
       </div>
 
       <div class="panel">
-        <div class="prow">
-          <label for="rangeSel">Период:</label>
-          <select id="rangeSel" onchange="setRange()">
-            <option value="6">6 часов</option>
-            <option value="12" selected>12 часов</option>
-            <option value="24">1 сутки</option>
-            <option value="48">2 суток</option>
-            <option value="120">5 суток</option>
-            <option value="0">Вся история</option>
-          </select>
-        </div>
+        <p style="color:var(--mut);font-size:13px;margin:0">В окне графика видно последние 6 часов. Прокрутите его
+          влево (или проведите пальцем), чтобы увидеть сутки. Точки — минутные средние, раз в 5 минут.</p>
       </div>
     </div>
 
@@ -524,19 +555,15 @@
       <div class="panel">
         <h2>Настройки записи</h2>
         <div class="prow">
-          <label>Точка в память (сек):</label>
-          <input type="number" id="setPointSec" min="5" max="600" step="5">
-        </div>
-        <div class="prow" style="margin-top:10px">
           <label>Сохранение в файл (мин):</label>
-          <input type="number" id="setSaveMin" min="1" max="1440" step="1">
+          <input type="number" id="setSaveMin" min="10" max="60" step="1">
         </div>
         <div class="prow pbtns">
           <button class="btn" onclick="saveSettings()">Сохранить</button>
         </div>
         <div id="setmsg" style="font-size:13px;color:var(--ok);min-height:18px;margin-top:8px"></div>
-        <p style="color:var(--mut);font-size:12px">Точки в память попадают в графики (плавная линия), но не пишутся во
-          flash. В файл сохраняются реже — для длительной истории.</p>
+        <p style="color:var(--mut);font-size:12px">Точка — это минутное среднее (12 замеров по 5 с). На график точки
+          попадают сразу, а на flash пишутся пачкой раз в указанный интервал — так износ флеша минимален.</p>
       </div>
       <div class="panel">
         <h2>Файлы логов (LittleFS)</h2>
@@ -567,7 +594,6 @@
   </main>
   <script>
     let hist = [];
-    let histRange = null;
     let lastSeq = -1;
     let timeOkFlag = true;
     let upBase = 0, upAt = 0;
@@ -580,13 +606,12 @@
     function saveUi() {
       try {
         localStorage.setItem(LS_KEY, JSON.stringify(
-          { open: openCharts, range: $('rangeSel').value, tab: currentTab }));
+          { open: openCharts, tab: currentTab }));
       } catch (e) { }
     }
     function loadUi() {
       try {
         const u = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-        if (u.range && $('rangeSel').querySelector('option[value="' + u.range + '"]')) $('rangeSel').value = u.range;
         if (u.open) for (const k in MET) {
           openCharts[k] = !!u.open[k];
           $(MET[k].box).style.display = openCharts[k] ? 'block' : 'none';
@@ -595,7 +620,6 @@
         if (u.tab) showTab(u.tab, 0);
       } catch (e) { }
     }
-    function setRange() { saveUi(); loadCharts(true); }
 
     function showTab(t, dir) {
       const prev = currentTab;
@@ -614,7 +638,7 @@
       }
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
       if (t === 'data') { loadData(); loadSettings(); } if (t === 'calib') loadStatus();
-      if (t === 'live') drawAll();
+      if (t === 'live') { markDirty(); drawAll(); }
       saveUi();
       navScrollToActive(!!dir);
     }
@@ -643,7 +667,8 @@
     document.addEventListener('touchstart', e => {
       swEl = null;
       if (e.touches.length !== 1) { swTrack = false; return; }
-      if (e.target && e.target.closest && e.target.closest('nav')) { swTrack = false; return; }
+      const t = e.target;
+      if (t && t.closest && (t.closest('nav') || t.closest('.chart-scroll') || t.closest('.chartwrap') || t.closest('input[type=range]') || t.closest('select'))) { swTrack = false; return; }
       swX = e.touches[0].clientX; swY = e.touches[0].clientY;
       swStartTab = currentTab; swTrack = true; swDragging = false;
       swEl = $('tab-' + currentTab);
@@ -652,6 +677,8 @@
 
     document.addEventListener('touchmove', e => {
       if (!swTrack || !swEl) return;
+      const t = e.target;
+      if (t && t.closest && t.closest('.chart-scroll')) { swTrack = false; swEl = null; return; }
       const dx = e.touches[0].clientX - swX;
       const dy = e.touches[0].clientY - swY;
       if (!swDragging && Math.abs(dx) < Math.abs(dy) * 1.2) return; // вертикальный жест — не мешаем скроллу
@@ -685,59 +712,101 @@
 
 
     const MET = {
-      t: { cv: 'ch-t', box: 'c-t', ar: 'ar-t', color: '#f59e0b', label: '°C', field: 't' },
-      h: { cv: 'ch-h', box: 'c-h', ar: 'ar-h', color: '#38bdf8', label: '%', field: 'h' },
-      co2: { cv: 'ch-co2', box: 'c-co2', ar: 'ar-co2', color: '#22c55e', label: 'ppm', field: 'co2' }
+      t: { cv: 'ch-t', ay: 'cy-t', sc: 'cs-t', box: 'c-t', ar: 'ar-t', color: '#f59e0b', label: '°C', field: 't' },
+      h: { cv: 'ch-h', ay: 'cy-h', sc: 'cs-h', box: 'c-h', ar: 'ar-h', color: '#38bdf8', label: '%', field: 'h' },
+      co2: { cv: 'ch-co2', ay: 'cy-co2', sc: 'cs-co2', box: 'c-co2', ar: 'ar-co2', color: '#22c55e', label: 'ppm', field: 'co2' }
     };
     let openCharts = { t: false, h: false, co2: false };
+
+    // График: с сервера берём сутки, в окне видно 6 часов, остальное — прокруткой.
+    const TOTAL_HOURS   = 24;
+    const VISIBLE_HOURS = 6;
 
     function chartJobs() {
       const jobs = [];
       for (const k in MET) {
         if (!openCharts[k]) continue;
-        const m = MET[k], cv = $(m.cv); if (!cv) continue;
-        jobs.push({ cv, w: Math.max(160, cv.clientWidth || 600), m });
+        const m = MET[k], cv = $(m.cv), sc = $(m.sc); if (!cv || !sc) continue;
+        const cw = Math.max(160, sc.clientWidth || 300);
+        const w = Math.round(cw * TOTAL_HOURS / VISIBLE_HOURS); // холст в 4 раза шире экрана
+        jobs.push({ cv, ay: $(m.ay), sc, w, m });
       }
       return jobs;
     }
 
-    function drawKey() {
-      return currentTab + '|' + window.innerWidth + '|' + hist.length + '|' + (hist.length ? hist[hist.length - 1].ts : '') + '|' + Object.keys(MET).filter(k => openCharts[k]).join(',');
-    }
-    let lastDrawKey = '';
+    // Графики перерисовываются только когда реально что-то изменилось:
+    // пришли новые данные, график открыт/закрыт, изменился размер или прокрутка.
+    let chartDirty = true;
+    function markDirty() { chartDirty = true; }
 
     function drawAll() {
       if (currentTab !== 'live') return;
-      const key = drawKey();
-      if (key === lastDrawKey) return;
-      lastDrawKey = key;
-      for (const j of chartJobs()) drawChart(j.cv, j.m.color, j.m.label, hist, j.m.field, j.w);
+      if (!chartDirty) return;
+      chartDirty = false;
+      const jobs = chartJobs();
+      // запоминаем, был ли пользователь на правом краю — тогда прокрутку держим
+      for (const j of jobs)
+        j.wasEnd = !j.sc.dataset.init || (j.sc.scrollLeft + j.sc.clientWidth >= j.sc.scrollWidth - 5);
+      for (const j of jobs) drawChart(j.cv, j.ay, j.m.color, j.m.label, hist, j.m.field, j.w);
+      for (const j of jobs) {
+        if (j.wasEnd) j.sc.scrollLeft = Math.max(0, j.sc.scrollWidth - j.sc.clientWidth);
+        j.sc.dataset.init = '1';
+      }
     }
 
     function drawOne(k) {
       const m = MET[k]; if (!m) return;
-      const cv = $(m.cv); if (!cv) return;
-      drawChart(cv, m.color, m.label, hist, m.field, Math.max(160, cv.clientWidth || 600));
+      const cv = $(m.cv), sc = $(m.sc); if (!cv || !sc) return;
+      const cw = Math.max(160, sc.clientWidth || 300);
+      drawChart(cv, $(m.ay), m.color, m.label, hist, m.field, Math.round(cw * TOTAL_HOURS / VISIBLE_HOURS));
     }
 
     function toggleChart(k) {
       openCharts[k] = !openCharts[k];
       $(MET[k].box).style.display = openCharts[k] ? 'block' : 'none';
       $(MET[k].ar).textContent = openCharts[k] ? '▾' : '▸';
-      if (openCharts[k]) { drawOne(k); loadCharts(true); }
+      if (openCharts[k]) { markDirty(); drawOne(k); loadCharts(true); }
       saveUi();
     }
 
-    function drawChart(cv, color, label, data, yfield, w) {
+    // Разрыв в данных: если между соседними точками больше 10 минут —
+    // линия через пропуск не рисуется, а сам пропуск помечается.
+    const GAP_SEC = 600;
+    const AXIS_W  = 44; // ширина шкалы значений (не прокручивается)
+
+    // Смещение часового пояса сервера (сек) — вычисляется по dt первой точки,
+    // чтобы подписи времени совпадали с часами самого устройства.
+    function serverTzOffset(data) {
+      if (!data.length) return 0;
+      const d = data[0];
+      const m = String(d.dt || '').match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+      if (!m) return 0;
+      const asUTC = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+      return Math.round((asUTC - (Number(d.ts) || 0) * 1000) / 1000);
+    }
+
+    function fmtHour(ts, off) {
+      const d = new Date((ts + off) * 1000);
+      const hh = d.getUTCHours();
+      if (hh === 0) {
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+        return dd + '.' + mm + ' 00:00';
+      }
+      return String(hh).padStart(2, '0') + ':00';
+    }
+
+    function drawChart(cv, ay, color, label, data, yfield, w) {
       if (!cv) return;
       const h = window.innerWidth < 760 ? 190 : 280;
       const dpr = window.devicePixelRatio || 1;
 
       const W = Math.round(w * dpr), H = Math.round(h * dpr);
       if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+      if (cv.style.width !== w + 'px') cv.style.width = w + 'px';
       if (cv.style.height !== h + 'px') cv.style.height = h + 'px';
       const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
-      const pad = { l: 44, r: 10, t: 16, b: 24 };
+      const pad = { l: 0, r: 10, t: 16, b: 24 };
 
       let min = Infinity, max = -Infinity;
       for (let i = 0; i < data.length; i++) {
@@ -747,34 +816,92 @@
       if (!isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
       if (min === max) { min -= 1; max += 1; }
       const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
-      g.lineWidth = 1; g.strokeStyle = '#334155'; g.fillStyle = '#94a3b8'; g.font = '11px sans-serif';
+
+      // ---- шкала значений: отдельный canvas, не уезжает при прокрутке ----
+      if (ay) {
+        if (ay.width !== Math.round(AXIS_W * dpr) || ay.height !== H) {
+          ay.width = Math.round(AXIS_W * dpr); ay.height = H;
+        }
+        if (ay.style.height !== h + 'px') ay.style.height = h + 'px';
+        const a = ay.getContext('2d');
+        a.setTransform(dpr, 0, 0, dpr, 0, 0); a.clearRect(0, 0, AXIS_W, h);
+        a.fillStyle = '#94a3b8'; a.font = '11px sans-serif'; a.textAlign = 'right';
+        for (let i = 0; i <= 4; i++) {
+          const y = pad.t + ph * i / 4;
+          const v = max - (max - min) * i / 4;
+          a.fillText(v.toFixed(1), AXIS_W - 4, y + 4);
+        }
+        a.textAlign = 'left';
+      }
+
+      // ---- сетка: горизонтальные линии + значения (на шкале) ----
+      g.lineWidth = 1; g.strokeStyle = '#334155'; g.font = '11px sans-serif';
       for (let i = 0; i <= 4; i++) {
         const y = pad.t + ph * i / 4;
         g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
-        const v = max - (max - min) * i / 4; g.fillText(v.toFixed(1), 4, y + 4);
       }
       if (data.length) {
 
-        const t0 = Number(data[0].ts) || 0, t1 = Number(data[data.length - 1].ts) || 0;
+        // весь диапазон — сутки назад от последней точки
+        const t1 = Number(data[data.length - 1].ts) || 0;
+        const t0 = t1 - TOTAL_HOURS * 3600;
         const span = (t1 > t0) ? (t1 - t0) : 0;
         const X = ts => span ? (pad.l + pw * Math.max(0, Math.min(1, (Number(ts) - t0) / span))) : pad.l + pw / 2;
-        const fs = String(data[0].dt || '').slice(5, 16), ls = String(data[data.length - 1].dt || '').slice(5, 16);
-        g.fillText(fs, pad.l, h - 8);
-        g.fillText(ls, w - pad.r - g.measureText(ls).width, h - 8);
-        g.beginPath(); g.strokeStyle = color; g.lineWidth = 2;
+
+        // вертикальная сетка по часам с подписями
+        const off = serverTzOffset(data);
+        g.fillStyle = '#64748b'; g.font = '10px sans-serif';
+        for (let gx = Math.ceil((t0 + off) / 3600) * 3600 - off; gx <= t1; gx += 3600) {
+          const x = pad.l + pw * (gx - t0) / span;
+          if (x < pad.l - 1 || x > w - pad.r + 1) continue;
+          g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
+          g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
+          g.fillText(fmtHour(gx, off), x + 3, h - 8);
+        }
+
+        // режем данные на сегменты: разрыв > GAP_SEC разрывает линию
+        const segs = [];
+        let seg = [], prevTs = 0;
         for (let i = 0; i < data.length; i++) {
           const d = data[i];
-          const x = (data.length > 1) ? X(d.ts) : pad.l + pw / 2;
+          const x = X(d.ts);
           let v = Number(d[yfield]); if (!isFinite(v)) v = 0;
           const y = pad.t + ph * (1 - (v - min) / (max - min));
-          i ? g.lineTo(x, y) : g.moveTo(x, y);
+          const ts = Number(d.ts) || 0;
+          if (i > 0 && (ts - prevTs) > GAP_SEC) {
+            if (seg.length) segs.push(seg);
+            seg = [];
+          }
+          seg.push([x, y]);
+          prevTs = ts;
         }
-        g.stroke();
-        g.lineTo(pad.l + pw, pad.t + ph); g.lineTo(pad.l, pad.t + ph); g.closePath();
-        g.fillStyle = color + '22'; g.fill();
+        if (seg.length) segs.push(seg);
+
+        for (const s of segs) {
+          g.beginPath(); g.strokeStyle = color; g.lineWidth = 2;
+          g.moveTo(s[0][0], s[0][1]);
+          for (let i = 1; i < s.length; i++) g.lineTo(s[i][0], s[i][1]);
+          g.stroke();
+          // заливка под линией — отдельно по каждому сегменту
+          if (s.length > 1) {
+            g.lineTo(s[s.length - 1][0], pad.t + ph);
+            g.lineTo(s[0][0], pad.t + ph);
+            g.closePath();
+            g.fillStyle = color + '22'; g.fill();
+          }
+        }
+        // штриховая линия на месте разрыва — видно, что данных не было
+        g.save();
+        g.setLineDash([3, 3]); g.strokeStyle = '#64748b'; g.lineWidth = 1;
+        for (let k = 1; k < segs.length; k++) {
+          const x = segs[k][0][0];
+          if (!isFinite(x)) continue;
+          g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
+        }
+        g.restore();
       }
       g.fillStyle = '#e2e8f0'; g.font = '12px sans-serif';
-      g.fillText(label, pad.l, 11);
+      g.fillText(label, pad.l + 4, 11);
     }
 
     async function api(u) { const r = await fetch(u, { cache: 'no-store' }); return r.json(); }
@@ -804,7 +931,7 @@
         statsFirst = s.firstTs || 0; statsLast = s.timestamp || 0;
         updateLogBadge();
 
-        if (s.timeOk && !timeOkFlag) { timeOkFlag = true; histRange = null; loadCharts(true); }
+        if (s.timeOk && !timeOkFlag) { timeOkFlag = true; loadCharts(true); }
         else if (!s.timeOk) timeOkFlag = false;
 
         if (s.pointsSeq !== lastSeq) { lastSeq = s.pointsSeq; loadCharts(false); }
@@ -819,26 +946,23 @@
       if (chartsBusy) { chartsQueued = true; chartsQueuedFull = chartsQueuedFull || !!full; return; }
       chartsBusy = true;
       try {
-        const hours = $('rangeSel').value;
-        const hrs = parseFloat(hours) || 0;
-        if (full || !hist.length || histRange !== hours) {
-
-          histRange = hours;
-          hist = await api('/api/history?hours=' + hours);
+        if (full || !hist.length) {
+          // полная сутки: сервер сам прореживает точки до ~300
+          hist = await api('/api/history?hours=' + TOTAL_HOURS);
         } else {
-
+          // догружаем только новые минутные точки
           const since = hist.length ? hist[hist.length - 1].ts : 0;
           const add = await api('/api/history?since=' + since);
           if (add && add.length) hist = hist.concat(add);
         }
 
         const last = hist.length ? Number(hist[hist.length - 1].ts) || 0 : 0;
-        if (hrs > 0 && last > 0) {
-          const cut = last - hrs * 3600;
+        if (last > 0) {
+          const cut = last - TOTAL_HOURS * 3600;
           hist = hist.filter(d => Number(d.ts) >= cut);
         }
-        const cap = hrs > 0 ? 600 : 1500;
-        if (hist.length > cap) hist = hist.slice(hist.length - cap);
+        if (hist.length > 600) hist = hist.slice(hist.length - 600);
+        markDirty();
         drawAll();
         updateLogBadge();
       } catch (e) { }
@@ -905,14 +1029,13 @@
     async function loadSettings() {
       try {
         const s = await api('/api/settings');
-        $('setPointSec').value = s.pointSec; $('setSaveMin').value = s.saveMin;
-        $('setPointSec').min = s.minPointSec; $('setPointSec').max = s.maxPointSec;
+        $('setSaveMin').value = s.saveMin;
         $('setSaveMin').min = s.minSaveMin; $('setSaveMin').max = s.maxSaveMin;
       } catch (e) { }
     }
 
     async function saveSettings() {
-      const b = new URLSearchParams({ pointSec: $('setPointSec').value, saveMin: $('setSaveMin').value });
+      const b = new URLSearchParams({ saveMin: $('setSaveMin').value });
       const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b });
       $('setmsg').textContent = await r.text(); loadCharts(true);
     }
@@ -942,7 +1065,31 @@
       $('logBadge').textContent = 'Записей: ' + (statsFiles + statsRam) + logSpan();
       $('logBadge').title = 'В файлах: ' + statsFiles + ' · в ОЗУ: ' + statsRam + ' · на графике: ' + hist.length;
     }
-    window.addEventListener('resize', drawAll);
+    window.addEventListener('resize', () => { markDirty(); drawAll(); });
+
+    // Прокрутка одного графика прокручивает остальные: окно времени общее,
+    // иначе графики показывали бы разные периоды.
+    function syncScroll(src) {
+      const max = Math.max(1, src.scrollWidth - src.clientWidth);
+      const frac = Math.min(1, Math.max(0, src.scrollLeft / max));
+      const all = document.querySelectorAll('.chart-scroll');
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i];
+        if (el === src) continue;
+        const m = Math.max(0, el.scrollWidth - el.clientWidth);
+        const want = Math.round(frac * m);
+        if (el.scrollLeft !== want) el.scrollLeft = want;
+      }
+    }
+    document.querySelectorAll('.chart-scroll').forEach(el => {
+      el.addEventListener('touchstart', (e) => {
+        // Не давать свайпу вкладок перехватить жест прокрутки графика
+        if (e.touches && e.touches.length === 1) {
+          swTrack = false; swEl = null;
+        }
+      }, { passive: true });
+      el.addEventListener('scroll', () => syncScroll(el));
+    });
     loadUi();
     pollLive();
     loadCharts(true);

@@ -808,9 +808,21 @@
       const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
       const pad = { l: 0, r: 10, t: 16, b: 24 };
 
+      // CO2 == null / 0 — «нет валидного замера»: такие точки не рисуем,
+      // а разрываем линию (для t/h 0 — нормальное значение).
+      const isCo2 = yfield === 'co2';
+      const val = d => {
+        const raw = d[yfield];
+        if (raw === null || raw === undefined || raw === '') return null;
+        const v = Number(raw);
+        if (!isFinite(v) || (isCo2 && v <= 0)) return null;
+        return v;
+      };
+
       let min = Infinity, max = -Infinity;
       for (let i = 0; i < data.length; i++) {
-        let v = Number(data[i][yfield]); if (!isFinite(v)) v = 0;
+        const v = val(data[i]);
+        if (v === null) continue;
         if (v < min) min = v; if (v > max) max = v;
       }
       if (!isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
@@ -864,8 +876,13 @@
         let seg = [], prevTs = 0;
         for (let i = 0; i < data.length; i++) {
           const d = data[i];
+          const v = val(d);
+          if (v === null) { // нет данных — закрываем сегмент, линию не тянем
+            if (seg.length) segs.push(seg);
+            seg = []; prevTs = 0;
+            continue;
+          }
           const x = X(d.ts);
-          let v = Number(d[yfield]); if (!isFinite(v)) v = 0;
           const y = pad.t + ph * (1 - (v - min) / (max - min));
           const ts = Number(d.ts) || 0;
           if (i > 0 && (ts - prevTs) > GAP_SEC) {
@@ -919,7 +936,8 @@
           if (!(hl >= 0 && hl <= 600)) hl = 0; // защита от мусора в конце прогрева
           $('s-mhz').innerHTML = '<span class="heat">идёт прогрев, ' + hl + ' с</span>';
         } else {
-          $('v-co2').innerHTML = s.co2;
+          const co2 = Number(s.co2);
+          $('v-co2').innerHTML = (isFinite(co2) && co2 > 0) ? co2 : '—';
           $('s-mhz').innerHTML = s.mhzOk ? '<span class="ok"></span>' : '<span class="bad">MH-Z19 нет связи</span>';
         }
         $('s-dht').innerHTML = s.dhtOk ? '<span class="ok"></span>' : '<span class="bad">DHT22 нет связи</span>';
@@ -979,7 +997,7 @@
         const tb = $('tbl').querySelector('tbody'); tb.innerHTML = '';
         const rows = h.slice(-50).reverse();
         let html = '';
-        rows.forEach(d => { html += `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2}</td></tr>`; });
+        rows.forEach(d => { html += `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2 > 0 ? d.co2 : '—'}</td></tr>`; });
         tb.innerHTML = html;
         const shownN = rows.length;
         const totalN = Math.max(shownN, statsFiles + statsRam);
@@ -1010,7 +1028,9 @@
     async function loadStatus() {
       try {
         const s = await api('/api/sensor');
-        $('calstat').innerHTML = `Диапазон: ${s.range} ppm · ABC: ${s.abc === 1 || s.abc === true ? 'вкл' : 'выкл'} · CO₂ сейчас: ${s.heating ? '♨️' : s.co2 + ' ppm'} · Связь: ${s.heating ? 'прогрев' : (s.mhzOk ? 'OK' : 'нет данных')}`;
+        const co2 = Number(s.co2);
+        const co2Txt = s.heating ? '♨️' : (isFinite(co2) && co2 > 0 ? co2 + ' ppm' : '—');
+        $('calstat').innerHTML = `Диапазон: ${s.range} ppm · ABC: ${s.abc === 1 || s.abc === true ? 'вкл' : 'выкл'} · CO₂ сейчас: ${co2Txt} · Связь: ${s.heating ? 'прогрев' : (s.mhzOk ? 'OK' : 'нет данных')}`;
       } catch (e) { $('calstat').textContent = 'Ошибка запроса'; }
     }
 

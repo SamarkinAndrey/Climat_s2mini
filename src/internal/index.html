@@ -498,7 +498,7 @@
   <nav>
     <button class="active" data-tab="live" onclick="showTab('live')">Показания</button>
     <button data-tab="wifi" onclick="showTab('wifi')">Wi-Fi</button>
-    <button data-tab="calib" onclick="showTab('calib')">Калибровка MH-Z19</button>
+    <button data-tab="calib" onclick="showTab('calib')">Калибровка CO₂</button>
     <button data-tab="data" onclick="showTab('data')">Данные</button>
   </nav>
   <main>
@@ -575,7 +575,7 @@
 
     <div class="tab" id="tab-calib">
       <div class="panel">
-        <h2>Ручная калибровка MH-Z19</h2>
+        <h2>Ручная калибровка CO₂</h2>
         <p style="color:var(--mut);font-size:13px;margin-bottom:12px"><b>Zero calibration (400 ppm)</b> — вынесите
           датчик на свежий воздух на 20 минут, затем нажмите. Требуется прогрев датчика ≥ 48 часов.<br><b>Span
             calibration (2000 ppm)</b> — с эталонным газом 2000 ppm.</p>
@@ -1016,9 +1016,9 @@
         } else {
           const co2 = Number(s.co2);
           $('v-co2').innerHTML = (isFinite(co2) && co2 > 0) ? co2 : '—';
-          $('s-mhz').innerHTML = s.mhzOk ? '<span class="ok"></span>' : '<span class="bad">MH-Z19 нет связи</span>';
+          $('s-mhz').innerHTML = s.mhzOk ? '<span class="ok"></span>' : '<span class="bad">нет связи</span>';
         }
-        $('s-dht').innerHTML = s.dhtOk ? '<span class="ok"></span>' : '<span class="bad">DHT22 нет связи</span>';
+        $('s-dht').innerHTML = s.dhtOk ? '<span class="ok"></span>' : '<span class="bad">нет связи</span>';
         $('netBadge').textContent = (s.mode === 'AP' ? 'Точка доступа' : 'Сеть: ' + s.ip) + (s.mdnsOk ? ' · ' + s.mdns : '');
         $('netBadge').title = s.mdnsOk ? ('Можно открывать по имени: http://' + s.mdns) : 'mDNS не запущен — используйте IP';
         $('timeBadge').textContent = 'Дата: ' + s.datetime;

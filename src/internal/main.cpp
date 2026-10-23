@@ -1129,7 +1129,8 @@ static String listLogFiles() {
   int           nf  = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
   sortNames(names, nf);
 
-  for (int i = 0; i < nf; i++) {
+  // Новые сверху
+  for (int i = nf - 1; i >= 0; i--) {
     int    slash = names[i].lastIndexOf('/');
     String base  = slash >= 0 ? names[i].substring(slash + 1) : names[i];
     size_t size  = 0;
@@ -1138,7 +1139,7 @@ static String listLogFiles() {
       size = f.size();
       f.close();
     }
-    if (i)
+    if (i < nf - 1)
       out += ",";
     out += "{\"name\":\"" + base + "\",\"size\":" + String((unsigned)size) +
            ",\"ext\":" + (isExtLogFile(names[i]) ? "true" : "false") + "}";

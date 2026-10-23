@@ -1087,20 +1087,8 @@
     }
     window.addEventListener('resize', () => { markDirty(); drawAll(); });
 
-    // Прокрутка одного графика прокручивает остальные: окно времени общее,
-    // иначе графики показывали бы разные периоды.
-    function syncScroll(src) {
-      const max = Math.max(1, src.scrollWidth - src.clientWidth);
-      const frac = Math.min(1, Math.max(0, src.scrollLeft / max));
-      const all = document.querySelectorAll('.chart-scroll');
-      for (let i = 0; i < all.length; i++) {
-        const el = all[i];
-        if (el === src) continue;
-        const m = Math.max(0, el.scrollWidth - el.clientWidth);
-        const want = Math.round(frac * m);
-        if (el.scrollLeft !== want) el.scrollLeft = want;
-      }
-    }
+    // Каждый график прокручивается независимо — общего scroll-обработчика нет.
+    // Оставляем только защиту от перехвата жеста свайпом вкладок.
     document.querySelectorAll('.chart-scroll').forEach(el => {
       el.addEventListener('touchstart', (e) => {
         // Не давать свайпу вкладок перехватить жест прокрутки графика
@@ -1108,7 +1096,6 @@
           swTrack = false; swEl = null;
         }
       }, { passive: true });
-      el.addEventListener('scroll', () => syncScroll(el));
     });
     loadUi();
     pollLive();

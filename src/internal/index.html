@@ -595,6 +595,7 @@
     </div>
 
     <div class="tab" id="tab-data">
+      <!--
       <div class="panel">
         <h2>Настройки записи</h2>
         <div class="prow">
@@ -608,6 +609,7 @@
         <p style="color:var(--mut);font-size:12px">Точка — это минутное среднее (12 замеров по 5 с). На график точки
           попадают сразу, а на flash пишутся пачкой раз в указанный интервал — так износ флеша минимален.</p>
       </div>
+      -->
       <div class="panel">
         <h2>Файлы логов (LittleFS)</h2>
         <div id="files" class="filelist" style="font-size:13px;color:var(--mut)">—</div>
@@ -682,7 +684,7 @@
         void el.offsetWidth;
       }
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
-      if (t === 'data') { loadData(); loadSettings(); } if (t === 'calib') loadStatus();
+      if (t === 'data') { loadData(); /* loadSettings(); */ } if (t === 'calib') loadStatus();
       if (t === 'live') { markDirty(); drawAll(); }
       saveUi();
       navScrollToActive(!!dir);

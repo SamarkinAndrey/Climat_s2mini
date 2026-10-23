@@ -826,27 +826,28 @@
         if (v < min) min = v; if (v > max) max = v;
       }
 
-      // Ось Y: всегда 5 диапазонов (6 подписей).
-      // CO2 по умолчанию 400..900 с шагом 100 (все значения кратны 10).
-      // Температура/влажность — шаг кратен 5, окно центрируется по данным,
-      // чтобы график шёл примерно посередине.
-      let step;
+      // Ось Y: шаг постоянный — 5 для температуры/влажности, 100 для CO2.
+      // Базово 5 диапазонов (6 подписей). Если данные выходят за них,
+      // количество диапазонов/подписей растёт, а шаг остаётся прежним.
+      let step, intervals;
       if (!isFinite(min) || !isFinite(max)) {
         min = isCo2 ? 400 : (yfield === 'h' ? 20 : 10);
         max = min + (isCo2 ? 500 : 25);
       }
       if (isCo2) {
         step = 100;
-        let lo = Math.min(400, Math.floor(min / 10) * 10);
-        while (lo + step * 5 < max)
-          step = (step === 100 ? 200 : step === 200 ? 250 : step === 250 ? 500 : step * 2);
+        const lo = Math.min(400, Math.floor(min / 100) * 100);
+        const hi = Math.max(900, Math.ceil(max / 100) * 100);
         min = lo;
-        max = lo + step * 5;
+        max = hi;
+        intervals = Math.round((hi - lo) / step);
       } else {
-        const span = max - min;
         step = 5;
-        while (step * 5 < span) step += 5;
-        const width  = step * 5;
+        const span = max - min;
+        // для узкого разброса — базовые 5 диапазонов; для широкого добавляем
+        // диапазоны с запасом, чтобы данные оставались примерно в середине
+        intervals = Math.max(5, Math.ceil(span / step) + (span > step * 4 ? 2 : 0));
+        const width  = intervals * step;
         const center = (min + max) / 2;
         let lo = Math.round((center - width / 2) / step) * step;
         if (min < lo) lo = Math.floor(min / step) * step;        // данные влезают слева
@@ -855,7 +856,7 @@
         max = lo + width;
       }
       const ticks = [];
-      for (let i = 0; i <= 5; i++) ticks.push(min + i * step);
+      for (let i = 0; i <= intervals; i++) ticks.push(min + i * step);
       const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
 
       // ---- шкала значений: отдельный canvas, не уезжает при прокрутке ----

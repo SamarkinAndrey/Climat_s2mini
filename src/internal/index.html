@@ -833,11 +833,6 @@
     function fmtHour(ts, off) {
       const d = new Date((ts + off) * 1000);
       const hh = d.getUTCHours();
-      if (hh === 0) {
-        const dd = String(d.getUTCDate()).padStart(2, '0');
-        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-        return dd + '.' + mm + ' 00:00';
-      }
       return String(hh).padStart(2, '0') + ':00';
     }
 
@@ -934,32 +929,22 @@
         const span = (t1 > t0) ? (t1 - t0) : 0;
         const X = ts => span ? (pad.l + pw * Math.max(0, Math.min(1, (Number(ts) - t0) / span))) : pad.l + pw / 2;
 
-        // вертикальная сетка по часам с подписями
+        // вертикальная сетка по часам с подписями (ровно 24 часа, равные промежутки)
         const off = serverTzOffset(data);
         g.fillStyle = '#64748b'; g.font = '10px sans-serif';
-        let lastLabelX = -10000;
-        for (let gx = Math.ceil((t0 + off) / 3600) * 3600 - off; gx <= t1; gx += 3600) {
-          const x = pad.l + pw * (gx - t0) / span;
+        for (let i = 0; i <= 24; i++) {
+          const gx = t0 + i * 3600;
+          if (gx > t1 + 1) break;
+          const x = pad.l + pw * i / 24;
           if (x < pad.l - 1 || x > w - pad.r + 1) continue;
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
           const lbl = fmtHour(gx, off);
-          const isMidnight = lbl.indexOf('00:00') >= 0;
-          const minGap = isMidnight ? 18 : (lbl.length > 5 ? 36 : 22);
-          if (x - lastLabelX < minGap && !isMidnight) continue;
-          if (!isMidnight && x - lastLabelX < minGap) continue;
-          let lx = x + 3;
           const tw = g.measureText(lbl).width;
+          let lx = x - tw / 2;
           if (lx < pad.l + 2) lx = pad.l + 2;
           if (lx > w - pad.r - tw - 2) lx = w - pad.r - tw - 2;
-          if (isMidnight && x - lastLabelX < 12) {
-            // всё равно пытаемся показать полночь, чуть сдвигаем
-            if (lx < pad.l + 2) lx = pad.l + 2;
-          } else if (x - lastLabelX < minGap) {
-            continue;
-          }
           g.fillText(lbl, lx, h - 8);
-          lastLabelX = x;
         }
 
         // режем данные на сегменты: разрыв > GAP_SEC разрывает линию

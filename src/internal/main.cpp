@@ -276,6 +276,29 @@ static uint32_t firstFileTs(const String &path) {
   return (uint32_t)strtoul(line.substring(0, comma).c_str(), nullptr, 10);
 }
 
+// Имя файла приходит из запроса — не даём выйти за пределы /logs.
+static bool isSafeLogName(const String &name) {
+  if (name.length() == 0 || name.length() > 64)
+    return false;
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0)
+    return false;
+  return name.endsWith(".csv");
+}
+
+// Самая ранняя метка времени среди основных логов (ext_* не учитываем).
+static uint32_t oldestMainTs() {
+  static String names[MAX_LIST_FILES];
+  int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+  int oi = -1;
+  for (int i = 0; i < n; i++) {
+    if (isExtLogFile(names[i]))
+      continue;
+    if (oi < 0 || names[i] < names[oi])
+      oi = i;
+  }
+  return oi >= 0 ? firstFileTs(names[oi]) : 0;
+}
+
 static void recountLogRows() {
   static String names[MAX_LIST_FILES];
   int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
@@ -1109,9 +1132,16 @@ static String listLogFiles() {
   for (int i = 0; i < nf; i++) {
     int    slash = names[i].lastIndexOf('/');
     String base  = slash >= 0 ? names[i].substring(slash + 1) : names[i];
+    size_t size  = 0;
+    File   f     = LittleFS.open(names[i], "r");
+    if (f) {
+      size = f.size();
+      f.close();
+    }
     if (i)
       out += ",";
-    out += "\"" + base + "\"";
+    out += "{\"name\":\"" + base + "\",\"size\":" + String((unsigned)size) +
+           ",\"ext\":" + (isExtLogFile(names[i]) ? "true" : "false") + "}";
   }
   out += "]";
   return out;
@@ -1121,118 +1151,6 @@ extern const uint8_t        index_html_start[] asm("_binary_src_internal_index_h
 extern const uint8_t        index_html_end[] asm("_binary_src_internal_index_html_end");
 static const uint8_t *const INDEX_HTML     = index_html_start;
 static const size_t         INDEX_HTML_LEN = (size_t)(index_html_end - index_html_start);
-
-struct ExportCtx {
-  String names[MAX_LIST_FILES];
-  int    n = 0;
-  int    idx = 0;
-  File   f;
-  size_t headerPos = 0;
-  char   pending[168];
-  size_t pendingLen = 0;
-};
-
-static bool exportNextLine(ExportCtx &c, char *line, size_t n) {
-  while (c.idx < c.n) {
-    if (!c.f) {
-      c.f = LittleFS.open(c.names[c.idx], "r");
-      if (!c.f) {
-        c.idx++;
-        continue;
-      }
-    }
-    if (!c.f.available()) {
-      c.f.close();
-      c.idx++;
-      continue;
-    }
-    size_t ln = c.f.readBytesUntil('\n', line, n - 1);
-    if (ln == 0) {
-      c.f.close();
-      c.idx++;
-      continue;
-    }
-    line[ln] = 0;
-    if (line[0] == 0 || strncmp(line, "timestamp", 9) == 0)
-      continue;
-    return true;
-  }
-  return false;
-}
-
-static size_t exportFill(void *ctx, uint8_t *buf, size_t maxLen) {
-  ExportCtx        *c   = (ExportCtx *)ctx;
-  size_t            out = 0;
-  static const char H[] = "timestamp,datetime,temperature,humidity,co2\n";
-  const size_t      HL  = sizeof(H) - 1;
-
-  if (maxLen == 0) {
-    if (c->headerPos < HL || c->pendingLen)
-      return RESPONSE_TRY_AGAIN;
-    char peek[160];
-    if (!exportNextLine(*c, peek, sizeof(peek)))
-      return 0;
-    size_t pn = strlen(peek);
-    memcpy(c->pending, peek, pn);
-    c->pending[pn] = '\n';
-    c->pendingLen  = pn + 1;
-    return RESPONSE_TRY_AGAIN;
-  }
-
-  bool locked = fsLock(2000);
-  char line[160];
-
-  while (out < maxLen) {
-    if (c->headerPos < HL) {
-      size_t take = HL - c->headerPos;
-      if (take > maxLen - out)
-        take = maxLen - out;
-      memcpy(buf + out, H + c->headerPos, take);
-      out += take;
-      c->headerPos += take;
-      continue;
-    }
-    if (c->pendingLen) {
-      size_t take = c->pendingLen;
-      if (take > maxLen - out)
-        take = maxLen - out;
-      memcpy(buf + out, c->pending, take);
-      out += take;
-      if (take < c->pendingLen) {
-        memmove(c->pending, c->pending + take, c->pendingLen - take);
-        c->pendingLen -= take;
-        break;
-      }
-      c->pendingLen = 0;
-      continue;
-    }
-    if (!exportNextLine(*c, line, sizeof(line)))
-      break;
-    size_t ll   = strlen(line);
-    size_t take = ll;
-    if (take > maxLen - out)
-      take = maxLen - out;
-    memcpy(buf + out, line, take);
-    out += take;
-    if (take < ll) {
-      memcpy(c->pending, line + take, ll - take);
-      c->pending[ll - take] = '\n';
-      c->pendingLen         = ll - take + 1;
-      break;
-    }
-    if (out < maxLen) {
-      buf[out++] = '\n';
-    } else {
-      c->pending[0] = '\n';
-      c->pendingLen = 1;
-      break;
-    }
-  }
-
-  if (locked)
-    fsUnlock();
-  return out;
-}
 
 static void setupWeb() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -1329,27 +1247,54 @@ static void setupWeb() {
     req->send(200, "application/json", out);
   });
 
-  server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *req) {
-    static ExportCtx ctx; // статический — не фрагментируем кучу на каждый экспорт
-    ctx     = ExportCtx();
-    if (fsLock(2000)) {
-      ctx.n = listFiles(LOGS_DIR, ctx.names, MAX_LIST_FILES);
+  server.on("/api/logs/file", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (!req->hasParam("name")) {
+      req->send(400, "text/plain", "Укажите name");
+      return;
+    }
+    String base = req->getParam("name")->value();
+    if (!isSafeLogName(base)) {
+      req->send(400, "text/plain", "Некорректное имя файла");
+      return;
+    }
+    // Отдаём файл как есть, без пересборки и добавления заголовков.
+    req->send(LittleFS, String(LOGS_DIR) + "/" + base, "text/csv", true);
+  });
+
+  server.on("/api/logs/delete", HTTP_POST, [](AsyncWebServerRequest *req) {
+    String base;
+    if (req->hasParam("name", true))
+      base = req->getParam("name", true)->value();
+    else if (req->hasParam("name"))
+      base = req->getParam("name")->value();
+    if (!isSafeLogName(base)) {
+      req->send(400, "text/plain", "Некорректное имя файла");
+      return;
+    }
+    String path = String(LOGS_DIR) + "/" + base;
+    if (!fsLock()) {
+      req->send(503, "text/plain", "Файловая система занята, повторите");
+      return;
+    }
+    if (!LittleFS.exists(path)) {
       fsUnlock();
+      req->send(404, "text/plain", "Файл не найден");
+      return;
     }
-    // Экспорт основной таблицы (5 колонок). Файлы внешнего блока (6 колонок,
-    // другая схема) сюда не попадают — иначе давление уедет в колонку CO2.
-    int w = 0;
-    for (int i = 0; i < ctx.n; i++) {
-      if (isExtLogFile(ctx.names[i]))
-        continue;
-      ctx.names[w++] = ctx.names[i];
+    bool     ext  = isExtLogFile(path);
+    uint32_t gone = ext ? 0 : countFileRows(path);
+    bool     ok   = LittleFS.remove(path);
+    if (ok && !ext) {
+      logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
+      oldestSavedTs = oldestMainTs();
     }
-    ctx.n = w;
-    sortNames(ctx.names, ctx.n);
-    ExportCtx *pc = &ctx;
-    req->sendChunked("text/csv", [pc](uint8_t *buf, size_t maxLen, size_t) -> size_t {
-      return exportFill(pc, buf, maxLen);
-    });
+    fsUnlock();
+    if (!ok) {
+      req->send(500, "text/plain", "Не удалось удалить файл");
+      return;
+    }
+    Serial.printf("[LOG] удалён по запросу: %s\n", base.c_str());
+    req->send(200, "text/plain", "Удалён " + base);
   });
 
   server.on("/api/wifi/save", HTTP_POST, [](AsyncWebServerRequest *req) {
@@ -1444,13 +1389,15 @@ static void setupWeb() {
     const int perPass = 2;
     int       removed = 0;
     for (int i = 0; i < nf && removed < perPass; i++) {
-      uint32_t gone = countFileRows(names[i]);
-      logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
+      bool     ext  = isExtLogFile(names[i]);
+      uint32_t gone = ext ? 0 : countFileRows(names[i]);
       LittleFS.remove(names[i]);
+      if (!ext)
+        logRowsTotal = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
       removed++;
     }
     int left      = nf - removed;
-    oldestSavedTs = (left > 0) ? firstFileTs(names[removed]) : 0;
+    oldestSavedTs = oldestMainTs();
     fsUnlock();
     if (left > 0) {
       req->send(200, "text/plain",

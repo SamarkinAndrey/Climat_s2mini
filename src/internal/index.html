@@ -292,6 +292,49 @@
       align-items: center
     }
 
+    .filelist {
+      display: flex;
+      flex-direction: column;
+      gap: 6px
+    }
+
+    .filerow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 8px;
+      border: 1px solid #334155;
+      border-radius: 8px
+    }
+
+    .finfo {
+      min-width: 0
+    }
+
+    .fname {
+      font-size: 13px;
+      color: var(--txt);
+      overflow-wrap: anywhere
+    }
+
+    .fmeta {
+      font-size: 11px;
+      color: var(--mut);
+      margin-top: 2px
+    }
+
+    .fbtns {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0
+    }
+
+    .fbtns button.btn {
+      padding: 6px 10px;
+      font-size: 12px
+    }
+
     input[type=text],
     input[type=password] {
       background: #0f172a;
@@ -567,9 +610,10 @@
       </div>
       <div class="panel">
         <h2>Файлы логов (LittleFS)</h2>
-        <div id="files" style="font-size:13px;color:var(--mut)">—</div>
-        <div class="row" style="margin-top:12px">
-          <button class="btn sec" onclick="exportCsv()">Скачать CSV</button>
+        <div id="files" class="filelist" style="font-size:13px;color:var(--mut)">—</div>
+        <div id="filesMsg" style="font-size:12px;color:var(--mut);min-height:16px;margin-top:8px"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn sec" onclick="downloadAllLogs()">Скачать все</button>
           <button class="btn warn" onclick="clearLogs()">Удалить все логи</button>
         </div>
       </div>
@@ -588,6 +632,7 @@
             <tbody></tbody>
           </table>
         </div>
+        <div id="tblNote" style="font-size:12px;color:var(--mut);margin-top:8px"></div>
       </div>
     </div>
 
@@ -1021,7 +1066,7 @@
     async function loadData() {
       try {
         const files = await api('/api/files');
-        $('files').innerHTML = files.length ? ('Файлов: ' + files.length + '<br>' + files.join('<br>')) : 'Нет файлов';
+        renderLogFiles(files);
         const h = await api('/api/history?points=50');
         const tb = $('tbl').querySelector('tbody'); tb.innerHTML = '';
         const rows = h.slice(-50).reverse();
@@ -1033,8 +1078,81 @@
         const note = shownN < totalN
           ? ('Показаны последние ' + shownN + ' из ' + totalN + ' записей.')
           : ('Показаны все ' + shownN + ' записей.');
-        $('files').innerHTML += '<br><span style="color:var(--mut)">' + note + ' Полные данные — в графиках и CSV.</span>';
+        $('tblNote').textContent = note;
       } catch (e) { }
+    }
+
+    function fmtSize(n) {
+      n = Number(n) || 0;
+      if (n < 1024) return n + ' Б';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' КБ';
+      return (n / (1024 * 1024)).toFixed(1) + ' МБ';
+    }
+
+    function renderLogFiles(files) {
+      const box = $('files');
+      box.innerHTML = '';
+      if (!files.length) { box.textContent = 'Нет файлов'; return; }
+      const head = document.createElement('div');
+      head.className = 'fmeta';
+      head.textContent = 'Файлов: ' + files.length;
+      box.appendChild(head);
+      files.forEach(f => {
+        const row = document.createElement('div'); row.className = 'filerow';
+        const info = document.createElement('div'); info.className = 'finfo';
+        const nm = document.createElement('div'); nm.className = 'fname'; nm.textContent = f.name;
+        const meta = document.createElement('div'); meta.className = 'fmeta';
+        meta.textContent = fmtSize(f.size) + (f.ext ? ' · внешний блок' : '');
+        info.append(nm, meta);
+        const btns = document.createElement('div'); btns.className = 'fbtns';
+        const dl = document.createElement('button'); dl.className = 'btn sec'; dl.textContent = 'Скачать';
+        dl.onclick = () => downloadLog(f.name);
+        const del = document.createElement('button'); del.className = 'btn warn'; del.textContent = 'Удалить';
+        del.onclick = () => deleteLog(f.name);
+        btns.append(dl, del);
+        row.append(info, btns);
+        box.appendChild(row);
+      });
+    }
+
+    function downloadLog(name) {
+      const a = document.createElement('a');
+      a.href = '/api/logs/file?name=' + encodeURIComponent(name);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    let downloadingAll = false;
+    async function downloadAllLogs() {
+      if (downloadingAll) return;
+      let files;
+      try { files = await api('/api/files'); } catch (e) { alert('Не удалось получить список файлов'); return; }
+      if (!files.length) { alert('Нет файлов для скачивания'); return; }
+      if (!confirm('Скачать все файлы по очереди (' + files.length + ')?\nБраузер может запросить разрешение на несколько загрузок.')) return;
+      downloadingAll = true;
+      const msg = $('filesMsg');
+      try {
+        for (let i = 0; i < files.length; i++) {
+          msg.textContent = 'Скачивание ' + (i + 1) + ' из ' + files.length + ': ' + files[i].name;
+          downloadLog(files[i].name);
+          await new Promise(r => setTimeout(r, 800));
+        }
+        msg.textContent = 'Передано файлов: ' + files.length;
+      } finally {
+        downloadingAll = false;
+      }
+    }
+
+    async function deleteLog(name) {
+      if (!confirm('Удалить файл\n' + name + '?')) return;
+      try {
+        const r = await fetch('/api/logs/delete?name=' + encodeURIComponent(name), { method: 'POST' });
+        const txt = await r.text();
+        if (!r.ok) { alert(txt); return; }
+        loadData();
+      } catch (e) { alert('Ошибка удаления'); }
     }
 
     async function saveWifi() {
@@ -1088,8 +1206,6 @@
       const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b });
       $('setmsg').textContent = await r.text(); loadCharts(true);
     }
-
-    function exportCsv() { location.href = '/api/export'; }
 
     function fmtUptime(t) {
       t = Math.max(0, Math.floor(t));

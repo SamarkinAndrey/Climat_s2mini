@@ -20,6 +20,7 @@
 #define MHZ_TX             16
 #define LOGS_DIR           "/logs"
 #define MAX_LOG_FILES      20
+#define MAX_LIST_FILES     32
 #define NTP_SERVER         "ru.pool.ntp.org"
 #define MDNS_HOST          "climat"
 // Опрос датчиков — раз в 5 с. Среднее считается за 5 минут (60 замеров по 5 с).
@@ -102,6 +103,81 @@ uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL;
 uint32_t pointsSeq       = 0;
 uint32_t logRowsTotal    = 0;
 uint32_t oldestSavedTs   = 0;
+
+struct LogFileEntry {
+  String name;
+  size_t size;
+  bool   ext;
+};
+static LogFileEntry logFilesCache[MAX_LIST_FILES];
+static int          logFilesCacheCount = 0;
+static bool         logFilesCacheDirty = true;
+static String       logFilesCacheJson = "[]";
+
+// Кэш списка файлов живёт в ОЗУ: при обновлении интерфейса LittleFS не читается.
+// Пересобирается только на старте и при изменениях. Размеры файлов обновляются
+// инкрементально в момент записи (flushHourToFlash), без открытия файлов.
+static int cacheFind(const String &name) {
+  for (int i = 0; i < logFilesCacheCount; i++)
+    if (logFilesCache[i].name == name)
+      return i;
+  return -1;
+}
+
+static void cacheToJson() {
+  String out = "[";
+  for (int i = logFilesCacheCount - 1; i >= 0; i--) { // новые сверху
+    if (i < logFilesCacheCount - 1)
+      out += ",";
+    out += "{\"name\":\"" + logFilesCache[i].name + "\",\"size\":" +
+           String((unsigned)logFilesCache[i].size) +
+           ",\"ext\":" + (logFilesCache[i].ext ? "true" : "false") + "}";
+  }
+  out += "]";
+  logFilesCacheJson = out;
+}
+
+static void cacheAddBytes(const String &name, size_t add, bool ext) {
+  if (logFilesCacheDirty)
+    return; // кэш ещё не построен — пересоберём целиком при первом запросе
+  int idx = cacheFind(name);
+  if (idx >= 0) {
+    logFilesCache[idx].size += add;
+    logFilesCache[idx].ext = ext;
+    cacheToJson();
+    return;
+  }
+  if (logFilesCacheCount >= MAX_LIST_FILES)
+    return;
+  int pos = logFilesCacheCount;
+  while (pos > 0 && logFilesCache[pos - 1].name > name) {
+    logFilesCache[pos] = logFilesCache[pos - 1];
+    pos--;
+  }
+  logFilesCache[pos] = {name, add, ext};
+  logFilesCacheCount++;
+  cacheToJson();
+}
+
+static void cacheAddPath(const String &path, size_t add, bool ext) {
+  int    slash = path.lastIndexOf('/');
+  String name  = slash >= 0 ? path.substring(slash + 1) : path;
+  cacheAddBytes(name, add, ext);
+}
+
+static void cacheRemovePath(const String &path) {
+  if (logFilesCacheDirty)
+    return;
+  int    slash = path.lastIndexOf('/');
+  String name  = slash >= 0 ? path.substring(slash + 1) : path;
+  int    idx   = cacheFind(name);
+  if (idx < 0)
+    return;
+  for (int i = idx; i < logFilesCacheCount - 1; i++)
+    logFilesCache[i] = logFilesCache[i + 1];
+  logFilesCacheCount--;
+  cacheToJson();
+}
 
 struct Point {
   uint32_t ts;
@@ -198,8 +274,6 @@ static String todayFile() {
 }
 
 // Статический список файлов логов (без std::vector — не фрагментируем кучу).
-#define MAX_LIST_FILES 32
-
 static int listFiles(const char *dirPath, String *names, int maxNames) {
   File dir = LittleFS.open(dirPath);
   if (!dir || !dir.isDirectory())
@@ -324,6 +398,7 @@ static void recountLogRows() {
     if (oi >= 0)
       oldestSavedTs = firstFileTs(names[oi]);
   }
+  logFilesCacheDirty = true;
   Serial.printf("[LOG] файлов %u (основных %d), записей всего %lu, самая ранняя %lu\n",
                 (unsigned)n, main, (unsigned long)total, (unsigned long)oldestSavedTs);
 }
@@ -341,7 +416,8 @@ static void rotateLogsIfNeeded() {
     Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
     uint32_t gone = countFileRows(names[oldestIdx]);
     logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
-    LittleFS.remove(names[oldestIdx]);
+    if (LittleFS.remove(names[oldestIdx]))
+      cacheRemovePath(names[oldestIdx]);
     for (int i = oldestIdx; i < n - 1; i++)
       names[i] = names[i + 1];
     n--;
@@ -682,23 +758,31 @@ static void flushHourToFlash() {
     LittleFS.mkdir(LOGS_DIR);
 
   if (hourCount > 0) {
-    String path  = todayFile();
-    bool   isNew = !LittleFS.exists(path);
-    File   f     = LittleFS.open(path, "a");
+    String path    = todayFile();
+    bool   isNew   = !LittleFS.exists(path);
+    File   f       = LittleFS.open(path, "a");
     if (f) {
-      if (isNew)
-        f.println("timestamp,datetime,temperature,humidity,co2");
+      size_t written = 0;
+      if (isNew) {
+        int n = f.println("timestamp,datetime,temperature,humidity,co2");
+        if (n > 0)
+          written += (size_t)n;
+      }
       for (uint8_t i = 0; i < hourCount; i++) {
         // 0 в CO2 — «нет валидного замера»: в файл пишем пустое поле, а не ложный 0.
+        int n;
         if (hourBuf[i].co2)
-          f.printf("%lu,%s,%.2f,%.2f,%u\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
-                   hourBuf[i].t, hourBuf[i].h, hourBuf[i].co2);
+          n = f.printf("%lu,%s,%.2f,%.2f,%u\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
+                       hourBuf[i].t, hourBuf[i].h, hourBuf[i].co2);
         else
-          f.printf("%lu,%s,%.2f,%.2f,\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
-                   hourBuf[i].t, hourBuf[i].h);
+          n = f.printf("%lu,%s,%.2f,%.2f,\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
+                       hourBuf[i].t, hourBuf[i].h);
+        if (n > 0)
+          written += (size_t)n;
       }
       f.close();
       logRowsTotal += hourCount;
+      cacheAddPath(path, written, false); // размер обновляем без чтения флеша
       Serial.printf("[LOG] сброс буфера: %u строк в %s\n", hourCount, path.c_str());
       hourCount = 0;
     } else {
@@ -707,17 +791,25 @@ static void flushHourToFlash() {
   }
 
   if (extHourCount > 0) {
-    String path  = extTodayFile();
-    bool   isNew = !LittleFS.exists(path);
-    File   f     = LittleFS.open(path, "a");
+    String path    = extTodayFile();
+    bool   isNew   = !LittleFS.exists(path);
+    File   f       = LittleFS.open(path, "a");
     if (f) {
-      if (isNew)
-        f.println("timestamp,datetime,temperature,humidity,pressure,batt");
-      for (uint8_t i = 0; i < extHourCount; i++)
-        f.printf("%lu,%s,%.2f,%.2f,%.1f,%.2f\n", extHourBuf[i].ts,
-                 fmtTime(extHourBuf[i].ts).c_str(), extHourBuf[i].t, extHourBuf[i].h,
-                 extHourBuf[i].p, extHourBuf[i].b);
+      size_t written = 0;
+      if (isNew) {
+        int n = f.println("timestamp,datetime,temperature,humidity,pressure,batt");
+        if (n > 0)
+          written += (size_t)n;
+      }
+      for (uint8_t i = 0; i < extHourCount; i++) {
+        int n = f.printf("%lu,%s,%.2f,%.2f,%.1f,%.2f\n", extHourBuf[i].ts,
+                         fmtTime(extHourBuf[i].ts).c_str(), extHourBuf[i].t, extHourBuf[i].h,
+                         extHourBuf[i].p, extHourBuf[i].b);
+        if (n > 0)
+          written += (size_t)n;
+      }
       f.close();
+      cacheAddPath(path, written, true);
       Serial.printf("[LOG] сброс буфера ext: %u строк в %s\n", extHourCount, path.c_str());
       extHourCount = 0;
     }
@@ -1123,29 +1215,33 @@ static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
   req->send(200, "application/json", out.c_str());
 }
 
-static String listLogFiles() {
+// Пересборка кэша. Вызывать только под fsLock: читает каталог и размеры файлов.
+static void rebuildLogFilesCache() {
   static String names[MAX_LIST_FILES];
-  String        out = "[";
-  int           nf  = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
+  int nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
   sortNames(names, nf);
-
-  // Новые сверху
-  for (int i = nf - 1; i >= 0; i--) {
+  logFilesCacheCount = 0;
+  for (int i = 0; i < nf && logFilesCacheCount < MAX_LIST_FILES; i++) {
     int    slash = names[i].lastIndexOf('/');
     String base  = slash >= 0 ? names[i].substring(slash + 1) : names[i];
-    size_t size  = 0;
+    bool   extf  = isExtLogFile(names[i]);
+    size_t fsize = 0;
     File   f     = LittleFS.open(names[i], "r");
     if (f) {
-      size = f.size();
+      fsize = f.size();
       f.close();
     }
-    if (i < nf - 1)
-      out += ",";
-    out += "{\"name\":\"" + base + "\",\"size\":" + String((unsigned)size) +
-           ",\"ext\":" + (isExtLogFile(names[i]) ? "true" : "false") + "}";
+    logFilesCache[logFilesCacheCount++] = {base, fsize, extf};
   }
-  out += "]";
-  return out;
+  cacheToJson();
+  logFilesCacheDirty = false;
+}
+
+// Вызывать только под fsLock.
+static String listLogFiles() {
+  if (logFilesCacheDirty)
+    rebuildLogFilesCache();
+  return logFilesCacheJson;
 }
 
 extern const uint8_t        index_html_start[] asm("_binary_src_internal_index_html_start");
@@ -1240,10 +1336,14 @@ static void setupWeb() {
   });
 
   server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *req) {
-    String out = "[]";
+    String out;
     if (fsLock(500)) {
       out = listLogFiles();
       fsUnlock();
+    } else {
+      // Не читаем кэш без блокировки: его может обновлять задача записи.
+      req->send(503, "text/plain", "Файловая система занята, повторите");
+      return;
     }
     req->send(200, "application/json", out);
   });
@@ -1285,9 +1385,12 @@ static void setupWeb() {
     bool     ext  = isExtLogFile(path);
     uint32_t gone = ext ? 0 : countFileRows(path);
     bool     ok   = LittleFS.remove(path);
-    if (ok && !ext) {
-      logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
-      oldestSavedTs = oldestMainTs();
+    if (ok) {
+      cacheRemovePath(path);
+      if (!ext) {
+        logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
+        oldestSavedTs = oldestMainTs();
+      }
     }
     fsUnlock();
     if (!ok) {
@@ -1392,7 +1495,8 @@ static void setupWeb() {
     for (int i = 0; i < nf && removed < perPass; i++) {
       bool     ext  = isExtLogFile(names[i]);
       uint32_t gone = ext ? 0 : countFileRows(names[i]);
-      LittleFS.remove(names[i]);
+      if (LittleFS.remove(names[i]))
+        cacheRemovePath(names[i]);
       if (!ext)
         logRowsTotal = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
       removed++;
@@ -1551,6 +1655,11 @@ void setup() {
     LittleFS.mkdir(LOGS_DIR);
 
   recountLogRows();
+  // Один раз на старте строим кэш списка файлов, дальше он обновляется в ОЗУ.
+  if (fsLock(2000)) {
+    rebuildLogFilesCache();
+    fsUnlock();
+  }
   preloadLiveFromFlash();
   dht.begin();
 

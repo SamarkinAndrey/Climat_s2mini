@@ -944,11 +944,11 @@
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
           const lbl = fmtHour(gx, off);
-          // не дублируем и не наслаиваем подписи, не выводим у самого края
-          if (x < pad.l + 8) continue;
-          if (x > w - pad.r - (lbl.length > 5 ? 68 : 36)) continue;
-          if (x - lastLabelX < (lbl.length > 5 ? 64 : 30)) continue;
-          g.fillText(lbl, x + 3, h - 8);
+          if (x - lastLabelX < (lbl.length > 5 ? 56 : 26)) continue;
+          let lx = x + 3;
+          if (lx < pad.l) lx = pad.l;
+          if (lx > w - pad.r - g.measureText(lbl).width) lx = w - pad.r - g.measureText(lbl).width;
+          g.fillText(lbl, lx, h - 8);
           lastLabelX = x;
         }
 

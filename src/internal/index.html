@@ -944,10 +944,20 @@
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
           const lbl = fmtHour(gx, off);
-          if (x - lastLabelX < (lbl.length > 5 ? 56 : 26)) continue;
+          const isMidnight = lbl.indexOf('00:00') >= 0;
+          const minGap = isMidnight ? 18 : (lbl.length > 5 ? 36 : 22);
+          if (x - lastLabelX < minGap && !isMidnight) continue;
+          if (!isMidnight && x - lastLabelX < minGap) continue;
           let lx = x + 3;
-          if (lx < pad.l) lx = pad.l;
-          if (lx > w - pad.r - g.measureText(lbl).width) lx = w - pad.r - g.measureText(lbl).width;
+          const tw = g.measureText(lbl).width;
+          if (lx < pad.l + 2) lx = pad.l + 2;
+          if (lx > w - pad.r - tw - 2) lx = w - pad.r - tw - 2;
+          if (isMidnight && x - lastLabelX < 12) {
+            // всё равно пытаемся показать полночь, чуть сдвигаем
+            if (lx < pad.l + 2) lx = pad.l + 2;
+          } else if (x - lastLabelX < minGap) {
+            continue;
+          }
           g.fillText(lbl, lx, h - 8);
           lastLabelX = x;
         }

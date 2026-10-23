@@ -937,12 +937,19 @@
         // вертикальная сетка по часам с подписями
         const off = serverTzOffset(data);
         g.fillStyle = '#64748b'; g.font = '10px sans-serif';
+        let lastLabelX = -10000;
         for (let gx = Math.ceil((t0 + off) / 3600) * 3600 - off; gx <= t1; gx += 3600) {
           const x = pad.l + pw * (gx - t0) / span;
           if (x < pad.l - 1 || x > w - pad.r + 1) continue;
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
-          g.fillText(fmtHour(gx, off), x + 3, h - 8);
+          const lbl = fmtHour(gx, off);
+          // не дублируем и не наслаиваем подписи, не выводим у самого края
+          if (x < pad.l + 8) continue;
+          if (x > w - pad.r - (lbl.length > 5 ? 68 : 36)) continue;
+          if (x - lastLabelX < (lbl.length > 5 ? 64 : 30)) continue;
+          g.fillText(lbl, x + 3, h - 8);
+          lastLabelX = x;
         }
 
         // режем данные на сегменты: разрыв > GAP_SEC разрывает линию

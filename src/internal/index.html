@@ -197,7 +197,8 @@
     .chartwrap .cay {
       flex: 0 0 44px;
       width: 44px;
-      display: block
+      display: block;
+      overflow: visible /* чтобы подпись могла вылезать вправо поверх графика */
     }
 
     .chart-scroll {
@@ -906,18 +907,34 @@
 
       // ---- шкала значений: отдельный canvas, не уезжает при прокрутке ----
       if (ay) {
-        if (ay.width !== Math.round(AXIS_W * dpr) || ay.height !== H) {
-          ay.width = Math.round(AXIS_W * dpr); ay.height = H;
+        // Ось Y имеет ширину AXIS_W, но подпись единиц должна лежать на графике
+        // (как раньше: pad.l + 4, 11). Поэтому канвас оси делаем шире на
+        // AXIS_W + 40px, а сам холст графика «начинается» с координаты AXIS_W.
+        // Цифры рисуем в правой части (выровнены по правому краю оси),
+        // подпись единиц — на AXIS_W + 4, то есть ровно на начале графика.
+        const AW = AXIS_W + 40; // запас, чтобы подпись «°C»/«ppm» не обрезалась
+        if (ay.width !== Math.round(AW * dpr) || ay.height !== H) {
+          ay.width = Math.round(AW * dpr); ay.height = H;
         }
         if (ay.style.height !== h + 'px') ay.style.height = h + 'px';
+        // канвас визуально шире колонки, но тянется от левого края.
+        if (ay.style.width !== AW + 'px') ay.style.width = AW + 'px';
+        if (ay.style.marginRight !== (-40) + 'px') ay.style.marginRight = '-40px';
+
         const a = ay.getContext('2d');
-        a.setTransform(dpr, 0, 0, dpr, 0, 0); a.clearRect(0, 0, AXIS_W, h);
+        a.setTransform(dpr, 0, 0, dpr, 0, 0); a.clearRect(0, 0, AW, h);
+
+        // цифры шкалы — справа, как и раньше (AXIS_W - 4)
         a.fillStyle = '#94a3b8'; a.font = '11px sans-serif'; a.textAlign = 'right';
         for (const v of ticks) {
           const y = pad.t + ph * (1 - (v - min) / (max - min));
           a.fillText(v.toFixed(0), AXIS_W - 4, y + 4);
         }
-        a.textAlign = 'left';
+
+        // подпись единиц — в той же точке, что и раньше (pad.l + 4, 11),
+        // но на неподвижной оси. Так она не уезжает при прокрутке графика.
+        a.fillStyle = '#e2e8f0'; a.font = '12px sans-serif'; a.textAlign = 'left';
+        a.fillText(label, AXIS_W + 4, pad.t - 7);
       }
 
       // ---- сетка: горизонтальные линии + значения (на шкале) ----
@@ -1013,8 +1030,6 @@
           }
         }
       }
-      g.fillStyle = '#e2e8f0'; g.font = '12px sans-serif';
-      g.fillText(label, pad.l + 4, 11);
     }
 
     async function api(u) { const r = await fetch(u, { cache: 'no-store' }); return r.json(); }
@@ -1034,8 +1049,15 @@
           $('s-mhz').innerHTML = '<span class="heat">идёт прогрев, ' + hl + ' с</span>';
         } else {
           const co2 = Number(s.co2);
-          $('v-co2').innerHTML = (isFinite(co2) && co2 > 0) ? co2 : '—';
-          $('s-mhz').innerHTML = s.mhzOk ? '<span class="ok"></span>' : '<span class="bad">нет связи</span>';
+          const hasCo2 = isFinite(co2) && co2 > 0;
+          $('v-co2').innerHTML = hasCo2 ? co2 : '—';
+          if (hasCo2 || s.mhzReady) {
+            $('s-mhz').innerHTML = s.mhzOk
+              ? '<span class="ok"></span>'
+              : '<span class="bad">нет связи</span>';
+          } else {
+            $('s-mhz').innerHTML = '<span class="heat">ожидание данных</span>';
+          }
         }
         $('s-dht').innerHTML = s.dhtOk ? '<span class="ok"></span>' : '<span class="bad">нет связи</span>';
         $('netBadge').textContent = (s.mode === 'AP' ? 'Точка доступа' : 'Сеть: ' + s.ip) + (s.mdnsOk ? ' · ' + s.mdns : '');
@@ -1209,7 +1231,18 @@
         const s = await api('/api/sensor');
         const co2 = Number(s.co2);
         const co2Txt = s.heating ? '♨️' : (isFinite(co2) && co2 > 0 ? co2 + ' ppm' : '—');
-        $('calstat').innerHTML = `Диапазон: ${s.range} ppm · ABC: ${s.abc === 1 || s.abc === true ? 'вкл' : 'выкл'} · CO₂ сейчас: ${co2Txt} · Связь: ${s.heating ? 'прогрев' : (s.mhzOk ? 'OK' : 'нет данных')}`;
+        let linkTxt;
+        if (s.heating) {
+          linkTxt = 'прогрев';
+        } else if (co2 > 0) {
+          linkTxt = 'OK';
+        } else if (s.mhzReady) {
+          linkTxt = 'нет связи';   // датчик уже отвечал, но сейчас молчит = отвал
+        } else {
+          linkTxt = 'ожидание данных'; // прогрева нет, первого чтения ещё не было
+        }
+        $('calstat').innerHTML =
+          `Диапазон: ${s.range} ppm · ABC: ${s.abc === 1 || s.abc === true ? 'вкл' : 'выкл'} · CO₂ сейчас: ${co2Txt} · Связь: ${linkTxt}`;
       } catch (e) { $('calstat').textContent = 'Ошибка запроса'; }
     }
 

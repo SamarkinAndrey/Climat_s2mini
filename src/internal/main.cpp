@@ -85,6 +85,7 @@ struct Reading {
 
 Reading  latest;
 bool     dhtOk = false, mhzOk = false;
+bool     mhzFirstReadDone = false;
 bool     mhzHeating      = true;
 bool     mdnsStarted     = false;
 bool     mdnsRestart     = false;
@@ -636,6 +637,7 @@ static void readSensors() {
     co2Fail = 0;
     setLatestCo2(co2);
     mhzOk = true;
+    mhzFirstReadDone = true;    
   } else if (err == RESULT_FILTER) {
     co2Fail = 0;
   } else {
@@ -864,6 +866,12 @@ static uint64_t uptimeMsTotal() {
   return total;
 }
 
+static uint32_t heatingLeftSec() {
+  uint32_t elapsed = millis() - heatingStartMs;
+  if (elapsed >= MHZ19_HEATING_TIME) return 0;
+  return (MHZ19_HEATING_TIME - elapsed) / 1000UL;
+}
+
 static size_t jsonCurrent(char *buf, size_t n) {
   JsonDocument doc;
 
@@ -882,8 +890,12 @@ static size_t jsonCurrent(char *buf, size_t n) {
     doc["co2"] = nullptr;
   doc["dhtOk"]       = dhtOk;
   doc["mhzOk"]       = mhzOk;
-  doc["heating"]     = heatingNow;
-  doc["heatLeft"]    = heatingNow ? (int)((MHZ19_HEATING_TIME - heatElapsed) / 1000UL) : 0;
+  doc["mhzReady"]    = mhzFirstReadDone;
+
+  uint32_t heatLeft = heatingLeftSec();
+  doc["heating"]     = (heatLeft > 0);
+  doc["heatLeft"]    = heatLeft;
+
   doc["timestamp"]   = r.timestamp;
   bool timeOk        = (time(nullptr) > 1000000);
   doc["timeOk"]      = timeOk;
@@ -1475,9 +1487,14 @@ static void setupWeb() {
       doc["co2"] = co2Now;
     else
       doc["co2"] = nullptr;
-    doc["mhzOk"]   = mhzOk;
-    doc["heating"] = mhzHeating;
-    char out[192];
+    doc["mhzOk"]    = mhzOk;
+    doc["mhzReady"] = mhzFirstReadDone;
+    
+    uint32_t heatLeft = heatingLeftSec();
+    doc["heating"]  = (heatLeft > 0);
+    doc["heatLeft"] = heatLeft;
+
+    char out[224];
     serializeJson(doc, out, sizeof(out));
     req->send(200, "application/json", out);
   });

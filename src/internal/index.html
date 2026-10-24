@@ -1177,6 +1177,13 @@
         const txt = await r.text();
         if (!r.ok) { alert(txt); return; }
         loadData();
+
+        // 2️⃣ Очищаем кэш точек графика (все данные, включая удалённые)
+        hist = [];
+        markDirty(); // помечаем, что графика нужно перерисовать
+
+        // Если нужен мгновенный пересчёт (один запрос к серверу, без flash):
+        // loadCharts(true);
       } catch (e) { alert('Ошибка удаления'); }
     }
 
@@ -1216,6 +1223,13 @@
         await new Promise(res => setTimeout(res, 300));
       }
       alert(msg); loadData();
+
+      // 2️⃣ Очищаем массив точек графика
+      hist = [];
+      markDirty(); // перерисовка при следующем опросе
+
+      // Если нужен мгновенный пересчёт (один запрос к серверу, без flash):
+      // loadCharts(true);
     }
 
     async function loadSettings() {

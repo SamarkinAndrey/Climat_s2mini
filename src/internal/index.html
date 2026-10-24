@@ -852,6 +852,7 @@
       if (cv.style.width !== w + 'px') cv.style.width = w + 'px';
       if (cv.style.height !== h + 'px') cv.style.height = h + 'px';
       const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+      g.lineJoin = 'round'; g.lineCap  = 'round';
       const pad = { l: 0, r: 10, t: 16, b: 24 };
 
       // CO2 == null / 0 — «нет валидного замера»: такие точки не рисуем,

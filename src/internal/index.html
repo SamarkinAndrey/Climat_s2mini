@@ -646,8 +646,10 @@
     let upBase = 0, upAt = 0;
     let statsFiles = 0, statsRam = 0;
     let statsFirst = 0, statsLast = 0;
+    let pollNextAt = 0;
     let currentTab = 'live';
     const $ = id => document.getElementById(id);
+    const POLL_MS = 5000;
 
     const LS_KEY = 'co2mon.ui';
     function saveUi() {
@@ -1002,6 +1004,7 @@
     async function api(u) { const r = await fetch(u, { cache: 'no-store' }); return r.json(); }
 
     async function pollLive() {
+      const started = Date.now();
       try {
         const s = await api('/api/current');
         $('v-t').innerHTML = s.temperature.toFixed(1);
@@ -1032,7 +1035,9 @@
 
         if (s.pointsSeq !== lastSeq) { lastSeq = s.pointsSeq; loadCharts(false); }
       } catch (e) { }
-      setTimeout(pollLive, 5000);
+      pollNextAt = started + POLL_MS;
+      const wait = Math.max(0, pollNextAt - Date.now());
+      setTimeout(pollLive, wait);      
     }
 
     let chartsTimer = null;

@@ -650,6 +650,7 @@
     let currentTab = 'live';
     const $ = id => document.getElementById(id);
     const POLL_MS = 5000;
+    const lineW = 2;
 
     const LS_KEY = 'co2mon.ui';
     function saveUi() {
@@ -988,14 +989,29 @@
           }
         }
         // штриховая линия на месте разрыва — видно, что данных не было
-        g.save();
-        g.setLineDash([3, 3]); g.strokeStyle = '#64748b'; g.lineWidth = 1;
-        for (let k = 1; k < segs.length; k++) {
-          const x = segs[k][0][0];
-          if (!isFinite(x)) continue;
-          g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
+        // g.save();
+        // g.setLineDash([3, 3]); g.strokeStyle = '#64748b'; g.lineWidth = 1;
+        // for (let k = 1; k < segs.length; k++) {
+        //   const x = segs[k][0][0];
+        //   if (!isFinite(x)) continue;
+        //   g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
+        // }
+        // g.restore();
+
+        for (const s of segs) {
+          if (s.length === 1) {
+            const x = s[0][0], y = s[0][1];
+            if (!isFinite(x) || !isFinite(y)) continue;
+            // заливка «под точкой» — полоса шириной с линию, от точки до низа
+            g.fillStyle = color + '22';
+            g.fillRect(x - lineW / 2, y, lineW, pad.t + ph - y);
+            // сама точка — диаметр = ширине линии
+            g.beginPath();
+            g.arc(x, y, lineW / 2, 0, Math.PI * 2);
+            g.fillStyle = color;
+            g.fill();
+          }
         }
-        g.restore();
       }
       g.fillStyle = '#e2e8f0'; g.font = '12px sans-serif';
       g.fillText(label, pad.l + 4, 11);

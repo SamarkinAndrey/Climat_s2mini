@@ -1532,8 +1532,6 @@ static void setupWeb() {
   server.begin();
 }
 
-static uint32_t lastMdnsStaIp = 0;
-
 static void startMdns() {
   if (mdnsStarted && !mdnsRestart)
     return;
@@ -1545,9 +1543,8 @@ static void startMdns() {
 
   if (mdnsRestart) {
     mdnsRestart = false;
-    if (mdnsStarted && WiFi.status() == WL_CONNECTED &&
-        lastMdnsStaIp != 0 && (uint32_t)WiFi.localIP() == lastMdnsStaIp)
-      return;
+    // Сравнение IP через (uint32_t) ломается между core 2.x и 3.x (разный
+    // порядок байт) — из-за этого mDNS не перезапускался после reconnect.
     if (mdnsStarted) {
       MDNS.end();
       mdnsStarted = false;
@@ -1564,7 +1561,6 @@ static void startMdns() {
   MDNS.setInstanceName("Climat Monitor");
   MDNS.addService("http", "tcp", 80);
   mdnsStarted   = true;
-  lastMdnsStaIp = (WiFi.status() == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
   Serial.printf("[MDNS] открыть: http://%s.local (%s, IP %s)\n", MDNS_HOST,
                 apMode ? "AP" : "STA",
                 apMode ? WiFi.softAPIP().toString().c_str()
@@ -1583,6 +1579,8 @@ static void setupNetwork() {
   }
 
   WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  WiFi.persistent(false);
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     switch ((int)event) {
       case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -1616,15 +1614,22 @@ static void setupNetwork() {
   if (cfgSsid.length()) {
     Serial.println("[NET] Пробую подключиться к: " + cfgSsid);
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setHostname(MDNS_HOST);
     WiFi.softAP(AP_SSID, AP_PASS);
+    // setHostname() строго после softAP(): в core 2.x softAP() сбрасывает
+    // hostname STA, заданный раньше.
+    WiFi.setHostname(MDNS_HOST);
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+    // Ждём именно выдачи IP, а не только WL_CONNECTED: бывает CONNECTED с 0.0.0.0.
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
+    while (millis() - t0 < 15000) {
+      if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0))
+        break;
       delay(200);
-    apMode = (WiFi.status() != WL_CONNECTED);
+    }
+    apMode = !(WiFi.status() == WL_CONNECTED &&
+               WiFi.localIP() != IPAddress(0, 0, 0, 0));
     if (apMode)
-      Serial.println("[NET] Не удалось, работаю точкой доступа (STA продолжит переподключение)");
+      Serial.println("[NET] Не удалось получить IP, работаю точкой доступа (STA продолжит переподключение)");
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
@@ -1712,48 +1717,50 @@ static void netTick() {
   uint32_t now = millis();
 
   if (cfgSsid.length()) {
-    bool conn = (WiFi.status() == WL_CONNECTED);
+    bool conn  = (WiFi.status() == WL_CONNECTED);
+    bool hasIp = conn && (WiFi.localIP() != IPAddress(0, 0, 0, 0));
 
     // STA поднялось (в т.ч. позже, после старта в AP) — переходим в сеть.
-    if (conn && apMode) {
+    if (hasIp && apMode) {
       apMode = false;
       Serial.printf("[NET] STA поднялось, работаю в сети, IP %s\n",
                     WiFi.localIP().toString().c_str());
       mdnsRestart = true;
     }
 
-    if (!conn) {
+    if (!hasIp) {
+      // «Связи нет» — и когда WL_DISCONNECTED, и когда WL_CONNECTED без IP.
       if (!staDownSinceMs) {
         staDownSinceMs = now;
-        Serial.printf("[NET] нет STA-связи (статус %d, последняя причина %u)\n",
-                      (int)WiFi.status(), (unsigned)lastStaDiscReason);
+        Serial.printf("[NET] нет рабочего STA (статус %d, ip %s, причина %u)\n",
+                      (int)WiFi.status(), WiFi.localIP().toString().c_str(),
+                      (unsigned)lastStaDiscReason);
       }
-      if (now - lastStaRetryMs >= 10000) {
+      // Жёсткий рестарт только после 2 мин простоя и не чаще раза в 30 с.
+      // reconnect() каждые 10 с ломал DHCP — IP не запрашивался заново.
+      if (now - lastStaRetryMs >= 30000 && now - staDownSinceMs >= 120000) {
         lastStaRetryMs = now;
-        if (now - staDownSinceMs >= 120000) {
-          Serial.println("[NET] простой STA > 2 мин — перезапускаю подключение");
-          WiFi.disconnect(false, false);
-          WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-        } else {
-          Serial.printf("[NET] попытка переподключения STA (статус %d)\n", (int)WiFi.status());
-          WiFi.reconnect();
-        }
+        Serial.println("[NET] простой STA > 2 мин — перезапускаю подключение");
+        WiFi.disconnect(true, false);
+        delay(100);
+        WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
       }
     } else {
       staDownSinceMs = 0;
     }
   }
-
+  
   if (now - lastHeartbeatMs >= 30000) {
     lastHeartbeatMs = now;
-    Serial.printf("[HB] up=%lus wifi=%d ip=%s gw=%s mask=%s dns=%s rssi=%d heap=%u dht=%d mhz=%d heat=%d ap=%d mdns=%d\n",
+    Serial.printf("[HB] up=%lus wifi=%d ip=%s gw=%s mask=%s dns=%s rssi=%d heap=%u maxAlloc=%u dht=%d mhz=%d heat=%d ap=%d mdns=%d\n",
                   (unsigned long)(now / 1000), (int)WiFi.status(),
                   (apMode ? WiFi.softAPIP() : WiFi.localIP()).toString().c_str(),
                   WiFi.gatewayIP().toString().c_str(),
                   WiFi.subnetMask().toString().c_str(),
                   WiFi.dnsIP().toString().c_str(),
                   (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
-                  (unsigned)ESP.getFreeHeap(), (int)dhtOk, (int)mhzOk, (int)mhzHeating,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+                  (int)dhtOk, (int)mhzOk, (int)mhzHeating,
                   (int)apMode, (int)mdnsStarted);
   }
 }

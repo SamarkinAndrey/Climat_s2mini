@@ -12,7 +12,10 @@
 #include <esp_now.h>
 #include <algorithm>
 #include <freertos/semphr.h>
+#include <memory>
 #include <string.h>
+
+#include "fpcs_minimal.h"
 
 #define DHT_PIN            5
 #define DHT_TYPE           22
@@ -20,25 +23,34 @@
 #define MHZ_TX             16
 #define LOGS_DIR           "/logs"
 #define MAX_LOG_FILES      20
-#define MAX_LIST_FILES     32
+#define MAX_LIST_FILES     64
 #define NTP_SERVER         "ru.pool.ntp.org"
 #define MDNS_HOST          "climat"
-// Опрос датчиков — раз в 5 с. Среднее считается за 5 минут (60 замеров по 5 с).
+// Опрос датчиков — раз в 5 с. Окно — 5 минут (60 замеров по 5 с), из него
+// FPCS оставляет 3–4 точки с пиками (см. fpcs_minimal.h).
 // Кольцо живых точек хранит последние 24 ч — ровно их и отдаём интерфейсу.
 // Запись на флеш — пачкой (flushHourToFlash) раз в saveMin минут.
 #define SENSOR_PERIOD_MS   5000UL
-#define SAMPLE_PERIOD_SEC  300UL  // период одного среднего: 5 минут
+#define SAMPLE_PERIOD_SEC  300UL  // длительность одного окна: 5 минут
 #define SAMPLES_PER_AVG    60     // 60 замеров по 5 с = 5 минут
 #define DEFAULT_POINT_SEC  300
 #define DEFAULT_SAVE_MIN   60
 #define MIN_SAVE_MIN       10
 #define MAX_SAVE_MIN       60
-#define FLASH_POINTS_MAX   12     // максимум точек в буфере флеша (60 мин / 5 мин)
-#define MAX_LIVE_POINTS    288    // 24 ч пятиминутных средних в ОЗУ (24*60/5)
-#define MAX_HISTORY_OUT    300
+#define FLASH_POINTS_MAX   80     // 12 окон * до 4 точек = 48, плюс большой запас
+#define FLUSH_RETRY_MS     5000UL // пауза между попытками сброса, если ФС занята
+#define MAX_LIVE_POINTS    1200   // 24 ч FPCS-точек: 288 окон * до 4 = 1152
+#define MAX_HISTORY_OUT    900    // полный /api/history: 600–900 точек
+#define PRELOAD_MAX_FILES  3      // при старте читаем только последние 3 основных файла
 #define FRONT_CAP_PERIOD   400
 #define FRONT_CAP_ALL      800
 #define MHZ19_HEATING_TIME (1000UL * 60UL * 3UL)
+
+// Пороги FPCS. DHT22 шумит на ±1–2 %, поэтому 5 % отсекает шум и оставляет
+// реальные пики (душ, проветривание зимой). MH-Z19 шумит на ±10–20 ppm,
+// поэтому 50 ppm — минимальный достоверный разброс внутри пятиминутки.
+#define FPCS_TH_H          5.0f
+#define FPCS_TH_CO2        50
 
 const char *AP_SSID = "CO2Monitor";
 const char *AP_PASS = "12345678";
@@ -78,8 +90,8 @@ static void fsUnlock() {
 
 struct Reading {
   uint32_t timestamp   = 0;
-  float    temperature = 0;
-  float    humidity    = 0;
+  float    temperature = NAN; // NaN — DHT ещё не ответил / нет замера
+  float    humidity    = NAN;
   uint16_t co2         = 0;
 };
 
@@ -96,8 +108,7 @@ uint8_t  lastStaDiscReason = 0; // код последнего отключен�
 uint32_t heatingStartMs  = 0;
 uint32_t lastLogMs       = 0;
 uint32_t lastNtpTry      = 0;
-uint32_t lastPointMs     = 0;
-uint16_t accN            = 0; // тиков накопления в текущую минуту (из 12)
+uint16_t accN            = 0; // тиков в текущем 5-минутном окне (из 60)
 bool     apMode          = true;
 bool     timeSynced      = false;
 uint32_t saveIntervalMs  = DEFAULT_SAVE_MIN * 60UL * 1000UL;
@@ -220,15 +231,18 @@ static bool   extSeen = false;      // хоть один пакет принят
 static uint32_t extLastRxMs = 0;    // millis() последнего пакета
 static portMUX_TYPE extMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Аккумуляторы средних за период (внутренний и внешний блоки)
+// Аккумулятор средних внешнего блока
 struct MinAcc {
   float    t = 0, h = 0, p = 0, b = 0;
-  uint32_t co2   = 0;
-  uint16_t nTh   = 0; // успешных измерений DHT за минуту
-  uint16_t nCo2  = 0; // успешных измерений MH-Z19 за минуту
-  uint16_t nExt  = 0; // пакетов внешнего блока за минуту
+  uint16_t nExt = 0; // пакетов внешнего блока за окно
 };
-static MinAcc accIn, accExt;
+static MinAcc accExt;
+
+// Сырые замеры текущего пятиминутного окна. При закрытии окна fpcs_select()
+// выбирает из них 3–4 точки, которые уходят в liveBuf и hourBuf.
+static Sample   rawBuf[SAMPLES_PER_AVG];
+static uint16_t rawCount = 0;
+static Sample   fpcsOut[FPCS_MAX_OUT];
 
 struct MinuteAvg {
   float    t, h;
@@ -236,7 +250,10 @@ struct MinuteAvg {
   uint32_t ts;
 };
 static MinuteAvg    hourBuf[FLASH_POINTS_MAX];
-static uint8_t      hourCount = 0;
+static uint8_t      hourCount   = 0;
+static uint8_t      hourWindows = 0; // закрытых 5-минутных окон в hourBuf
+static uint32_t     droppedFlashPoints = 0;
+static uint32_t     droppedExtPoints   = 0;
 static ExtAvg extHourBuf[FLASH_POINTS_MAX];
 static uint8_t      extHourCount = 0;
 
@@ -404,34 +421,58 @@ static void recountLogRows() {
                 (unsigned)n, main, (unsigned long)total, (unsigned long)oldestSavedTs);
 }
 
+// Ротация ведётся отдельно для основных и ext_*-файлов: иначе удаление
+// внешнего лога вычитало бы его строки из logRowsTotal, который считает только
+// основные, а oldestSavedTs мог стать временем ext-файла.
 static void rotateLogsIfNeeded() {
   static String names[MAX_LIST_FILES];
   int n = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
 
-  int removed = 0;
-  while (n > MAX_LOG_FILES && removed < 2) {
-    int oldestIdx = 0;
-    for (int i = 1; i < n; i++)
-      if (names[i] < names[oldestIdx])
-        oldestIdx = i;
-    Serial.printf("[LOG] ротация: удаляю %s\n", names[oldestIdx].c_str());
-    uint32_t gone = countFileRows(names[oldestIdx]);
-    logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
-    if (LittleFS.remove(names[oldestIdx]))
-      cacheRemovePath(names[oldestIdx]);
-    for (int i = oldestIdx; i < n - 1; i++)
+  int  removed     = 0;
+  bool mainRemoved = false;
+  while (removed < 4) {
+    int mainCount = 0, extCount = 0;
+    int oldestMain = -1, oldestExt = -1;
+    for (int i = 0; i < n; i++) {
+      if (isExtLogFile(names[i])) {
+        extCount++;
+        if (oldestExt < 0 || names[i] < names[oldestExt])
+          oldestExt = i;
+      } else {
+        mainCount++;
+        if (oldestMain < 0 || names[i] < names[oldestMain])
+          oldestMain = i;
+      }
+    }
+
+    int  idx;
+    bool ext;
+    if (mainCount > MAX_LOG_FILES) {
+      idx = oldestMain;
+      ext = false;
+    } else if (extCount > MAX_LOG_FILES) {
+      idx = oldestExt;
+      ext = true;
+    } else {
+      break;
+    }
+
+    Serial.printf("[LOG] ротация: удаляю %s\n", names[idx].c_str());
+    if (!ext) {
+      uint32_t gone = countFileRows(names[idx]);
+      logRowsTotal  = (logRowsTotal > gone) ? (logRowsTotal - gone) : 0;
+      mainRemoved   = true;
+    }
+    if (LittleFS.remove(names[idx]))
+      cacheRemovePath(names[idx]);
+    for (int i = idx; i < n - 1; i++)
       names[i] = names[i + 1];
     n--;
     removed++;
-    oldestSavedTs = 0;
-    if (n > 0) {
-      int oi = 0;
-      for (int i = 1; i < n; i++)
-        if (names[i] < names[oi])
-          oi = i;
-      oldestSavedTs = firstFileTs(names[oi]);
-    }
   }
+
+  if (mainRemoved)
+    oldestSavedTs = oldestMainTs();
 }
 
 static String extTodayFile() {
@@ -451,8 +492,13 @@ static String extTodayFile() {
 }
 
 // Запись отдельного «сырого» замера в файл больше не используется:
-// в файлы попадают только средние за период (flushHourToFlash).
+// в файлы попадают только точки FPCS (flushHourToFlash).
+// pointsSeq увеличивается вызывающим кодом один раз на пачку точек окна.
 static void pushLivePoint(const Reading &r) {
+  // До синхронизации времени ts == 0. Такие строки не должны попадать ни в
+  // график, ни в /api/history: они не привязаны к времени.
+  if (r.timestamp == 0)
+    return;
   portENTER_CRITICAL(&liveMux);
   Point &p = liveBuf[liveHead];
   p.ts     = r.timestamp;
@@ -463,7 +509,6 @@ static void pushLivePoint(const Reading &r) {
   if (liveCount < MAX_LIVE_POINTS)
     liveCount++;
   portEXIT_CRITICAL(&liveMux);
-  pointsSeq++;
 }
 
 static void liveSnapshot(int &head, int &count) {
@@ -588,8 +633,9 @@ static void readSensors() {
   float t  = dht.readTemperature();
   float h  = dht.readHumidity();
   bool  ok = !isnan(t) && !isnan(h);
-  if (ok)
-    setLatestTh(t, h);
+  // При отсутствии отклика не оставляем последнее удачное значение: иначе
+  // /api/current показывал бы «живые» T/H от старого замера. NaN -> null.
+  setLatestTh(ok ? t : NAN, ok ? h : NAN);
 
   static int lastOk = -1;
   if ((int)ok != lastOk) {
@@ -659,22 +705,28 @@ static void readSensors() {
   setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
 }
 
-// Пятиминутные средние: вызывается из loop() каждые SENSOR_PERIOD_MS.
-// Раз в SAMPLES_PER_AVG тиков закрывает интервал: среднее идёт в liveBuf/extBuf
-// (для графиков и /api/history?since=) и в буферы для записи на флеш.
+// Запись пачки FPCS-точек на флеш объявлена заранее: accumulateAvg() может
+// попросить сброс перед добавлением новой пачки (см. P2.1).
+static void flushHourToFlash();
+
+// Пятиминутное окно: вызывается из loop() каждые SENSOR_PERIOD_MS.
+// Внутри окна копим сырые замеры, раз в SAMPLES_PER_AVG тиков закрываем окно:
+// fpcs_select() выбирает 3–4 точки (границы + пики H/CO2), они идут в liveBuf
+// (графики, /api/history?since=) и в hourBuf (запись на флеш).
 static void accumulateAvg() {
   Reading r = getLatest();
   bool    thOk  = dhtOk && !isnan(r.temperature) && !isnan(r.humidity);
   bool    co2Ok = mhzOk && !mhzHeating && r.co2 > 0;
 
-  if (thOk) {
-    accIn.t += r.temperature;
-    accIn.h += r.humidity;
-    accIn.nTh++;
-  }
-  if (co2Ok) {
-    accIn.co2 += r.co2;
-    accIn.nCo2++;
+  // Полный сырой снимок: одна строка = ts + t + h + co2. Если DHT не ответил —
+  // T/H = NaN (не 0), FPCS не включает их в среднее и не строит по ним пики.
+  // co2 при отсутствии замера — 0 (наружу уходит null).
+  if ((thOk || co2Ok) && rawCount < SAMPLES_PER_AVG) {
+    Sample &s = rawBuf[rawCount++];
+    s.ts      = r.timestamp;
+    s.t       = thOk ? r.temperature : NAN;
+    s.h       = thOk ? r.humidity : NAN;
+    s.co2     = co2Ok ? r.co2 : 0;
   }
 
   // внешний блок считаем живым, если пакет был за последние 15 минут.
@@ -694,39 +746,62 @@ static void accumulateAvg() {
   if (++accN < SAMPLES_PER_AVG)
     return;
 
-  // ---- интервал среднего закрылся ----
+  // ---- окно закрылось ----
   uint32_t ts = timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+  bool     closedWithData = false;
 
-  if (accIn.nTh || accIn.nCo2) {
-    float avgT   = accIn.nTh ? accIn.t / accIn.nTh : r.temperature;
-    float avgH   = accIn.nTh ? accIn.h / accIn.nTh : r.humidity;
-    // Нет ни одного валидного замера CO2 за интервал (датчик отключён/прогрев/брак) —
-    // оставляем 0 как признак «нет данных». Наружу он уходит как null, в CSV — пустым.
-    uint16_t avgCo2 = accIn.nCo2 ? (uint16_t)(accIn.co2 / accIn.nCo2) : 0;
+  if (rawCount > 0) {
+    FpcsConfig cfg;
+    cfg.thH   = FPCS_TH_H;
+    cfg.thCo2 = (uint16_t)FPCS_TH_CO2;
 
-    Reading avg;
-    avg.timestamp   = ts;
-    avg.temperature = avgT;
-    avg.humidity    = avgH;
-    avg.co2         = avgCo2;
-    pushLivePoint(avg);
+    size_t outN = fpcs_select(rawBuf, rawCount, fpcsOut, cfg);
 
-    if (hourCount < FLASH_POINTS_MAX) {
-      hourBuf[hourCount].t   = avgT;
-      hourBuf[hourCount].h   = avgH;
-      hourBuf[hourCount].co2 = avgCo2;
-      hourBuf[hourCount].ts  = ts;
-      hourCount++;
-    } else {
-      // буфер переполнен (предыдущий сброс не удался) — данные не пишем,
-      // но сообщаем, чтобы не терять их молча
-      static uint32_t lastOverflowWarn = 0;
-      if (millis() - lastOverflowWarn > 60000UL) {
-        lastOverflowWarn = millis();
-        Serial.println("[LOG] буфер флеша переполнен — точки теряются (ФС занята?)");
+    if (outN > 0) {
+      // 12 окон по 4 точки = 48, буфер на 80. Если он всё-таки заполнен
+      // (прошлый сброс не удался), сначала пробуем записать накопленное,
+      // а не выбрасываем текущую пачку. До NTP не сбрасываем: время ещё 0.
+      if ((int)hourCount + (int)outN > FLASH_POINTS_MAX && timeSynced)
+        flushHourToFlash();
+
+      uint16_t dropped = 0;
+      for (size_t i = 0; i < outN; i++) {
+        Reading p;
+        p.timestamp   = fpcsOut[i].ts;
+        p.temperature = fpcsOut[i].t;
+        p.humidity    = fpcsOut[i].h;
+        p.co2         = fpcsOut[i].co2;
+        pushLivePoint(p);
+
+        if (hourCount < FLASH_POINTS_MAX) {
+          hourBuf[hourCount].t   = p.temperature;
+          hourBuf[hourCount].h   = p.humidity;
+          hourBuf[hourCount].co2 = p.co2;
+          hourBuf[hourCount].ts  = p.timestamp;
+          hourCount++;
+        } else {
+          dropped++;
+        }
       }
+
+      if (dropped) {
+        droppedFlashPoints += dropped;
+        static uint32_t lastOverflowWarn = 0;
+        if (millis() - lastOverflowWarn > 60000UL) {
+          lastOverflowWarn = millis();
+          Serial.printf("[LOG] буфер флеша переполнен: потеряно %u точек (всего %lu), ФС занята?\n",
+                        (unsigned)dropped, (unsigned long)droppedFlashPoints);
+        }
+      }
+
+      // Интерфейс опрашивает pointsSeq: одного сигнала на пачку достаточно.
+      pointsSeq++;
+      closedWithData = true;
+      Serial.printf("[FPCS] окно: сырых %u -> точек %u\n",
+                    (unsigned)rawCount, (unsigned)outN);
     }
   }
+  rawCount = 0;
 
   if (extAcc.nExt) {
     ExtAvg ea;
@@ -739,17 +814,30 @@ static void accumulateAvg() {
     if (extHourCount < FLASH_POINTS_MAX) {
       extHourBuf[extHourCount] = ea;
       extHourCount++;
+    } else {
+      droppedExtPoints++;
+      static uint32_t lastExtOverflowWarn = 0;
+      if (millis() - lastExtOverflowWarn > 60000UL) {
+        lastExtOverflowWarn = millis();
+        Serial.printf("[LOG] буфер флеша ext переполнен: потеряно %lu точек, ФС занята?\n",
+                      (unsigned long)droppedExtPoints);
+      }
     }
+    closedWithData = true;
   }
 
-  accIn = MinAcc();
-  accN  = 0;
+  // Счётчик окон не зависит от наличия внутренних датчиков: иначе внешний
+  // лог не сбрасывался бы никогда, если DHT/MH-Z19 молчат (P2.2).
+  if (closedWithData)
+    hourWindows++;
+
+  accN = 0;
   portENTER_CRITICAL(&extMux);
   accExt = MinAcc();
   portEXIT_CRITICAL(&extMux);
 }
 
-// Запись пачки пятиминутных средних на флеш (~288 строк/сутки).
+// Запись пачки FPCS-точек на флеш (обычно 2–3 точки на 5 мин).
 static void flushHourToFlash() {
   bool locked = fsLock(500);
   if (!locked) {
@@ -758,6 +846,8 @@ static void flushHourToFlash() {
   }
   if (!LittleFS.exists(LOGS_DIR))
     LittleFS.mkdir(LOGS_DIR);
+
+  bool wrote = false;
 
   if (hourCount > 0) {
     String path    = todayFile();
@@ -771,14 +861,22 @@ static void flushHourToFlash() {
           written += (size_t)n;
       }
       for (uint8_t i = 0; i < hourCount; i++) {
-        // 0 в CO2 — «нет валидного замера»: в файл пишем пустое поле, а не ложный 0.
-        int n;
-        if (hourBuf[i].co2)
-          n = f.printf("%lu,%s,%.2f,%.2f,%u\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
-                       hourBuf[i].t, hourBuf[i].h, hourBuf[i].co2);
+        // Пустое поле — «нет валидного замера» вместо ложного 0 / "nan".
+        char dt[24], tBuf[16], hBuf[16], cBuf[8];
+        fmtTimeBuf(hourBuf[i].ts, dt, sizeof(dt));
+        if (isfinite(hourBuf[i].t))
+          snprintf(tBuf, sizeof(tBuf), "%.2f", hourBuf[i].t);
         else
-          n = f.printf("%lu,%s,%.2f,%.2f,\n", hourBuf[i].ts, fmtTime(hourBuf[i].ts).c_str(),
-                       hourBuf[i].t, hourBuf[i].h);
+          tBuf[0] = 0;
+        if (isfinite(hourBuf[i].h))
+          snprintf(hBuf, sizeof(hBuf), "%.2f", hourBuf[i].h);
+        else
+          hBuf[0] = 0;
+        if (hourBuf[i].co2)
+          snprintf(cBuf, sizeof(cBuf), "%u", hourBuf[i].co2);
+        else
+          cBuf[0] = 0;
+        int n = f.printf("%lu,%s,%s,%s,%s\n", hourBuf[i].ts, dt, tBuf, hBuf, cBuf);
         if (n > 0)
           written += (size_t)n;
       }
@@ -786,10 +884,14 @@ static void flushHourToFlash() {
       logRowsTotal += hourCount;
       cacheAddPath(path, written, false); // размер обновляем без чтения флеша
       Serial.printf("[LOG] сброс буфера: %u строк в %s\n", hourCount, path.c_str());
-      hourCount = 0;
+      hourCount   = 0;
+      hourWindows = 0;
+      wrote       = true;
     } else {
       Serial.println("[LOG] ошибка открытия файла, сброс отложен");
     }
+  } else {
+    hourWindows = 0; // по основному буферу писать нечего
   }
 
   if (extHourCount > 0) {
@@ -814,11 +916,29 @@ static void flushHourToFlash() {
       cacheAddPath(path, written, true);
       Serial.printf("[LOG] сброс буфера ext: %u строк в %s\n", extHourCount, path.c_str());
       extHourCount = 0;
+      wrote        = true;
     }
   }
 
+  if (wrote)
+    lastLogMs = millis();
+
   rotateLogsIfNeeded();
   fsUnlock();
+}
+
+// Срезает с конца кольца точки без времени. После NTP они больше не нужны:
+// новые замеры уже пишутся с ts, а «нулевой хвост» сдвигал бы окно истории.
+static void dropLiveZeroTail() {
+  portENTER_CRITICAL(&liveMux);
+  while (liveCount > 0) {
+    int last = (liveHead - 1 + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+    if (liveBuf[last].ts != 0)
+      break;
+    liveHead = last;
+    liveCount--;
+  }
+  portEXIT_CRITICAL(&liveMux);
 }
 
 static void tryNtp() {
@@ -843,17 +963,18 @@ static void tryNtp() {
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);
     setLatestTs((uint32_t)tt);
-    // До синхронизации средние накапливались с ts=0 — в файлы такие строки
-    // попадать не должны. Сбрасываем накопленное и начинаем заново.
-    accIn       = MinAcc();
-    accN        = 0;
-    hourCount   = 0;
+    // До синхронизации замеры накапливались с ts=0 — в файлы и историю такие
+    // строки попадать не должны. Сбрасываем окно и начинаем заново.
+    dropLiveZeroTail();
+    rawCount     = 0;
+    accN         = 0;
+    hourWindows  = 0;
+    hourCount    = 0;
     extHourCount = 0;
     portENTER_CRITICAL(&extMux);
     accExt = MinAcc();
     portEXIT_CRITICAL(&extMux);
     lastLogMs   = millis();
-    lastPointMs = millis();
   }
 }
 
@@ -881,8 +1002,15 @@ static size_t jsonCurrent(char *buf, size_t n) {
   bool     heatingNow  = (heatElapsed < MHZ19_HEATING_TIME);
 
   Reading      r     = getLatest();
-  doc["temperature"] = r.temperature;
-  doc["humidity"]    = r.humidity;
+  // NaN — «датчик не ответил»: отдаём null, чтобы UI показал «—», а не 0.
+  if (isfinite(r.temperature))
+    doc["temperature"] = r.temperature;
+  else
+    doc["temperature"] = nullptr;
+  if (isfinite(r.humidity))
+    doc["humidity"] = r.humidity;
+  else
+    doc["humidity"] = nullptr;
   // 0 — признак «нет валидного замера», отдаём null (в UI будет «—»).
   if (r.co2)
     doc["co2"] = r.co2;
@@ -927,36 +1055,51 @@ static size_t jsonCurrent(char *buf, size_t n) {
 
   // Внешний блок (ESP-NOW): последние средние + статус связи
   {
-    int eh, ec;
-    extSnapshot(eh, ec);
-    bool alive;
-    uint32_t ago = 0;
+    // Один снимок под extMux: колбэк ESP-NOW пишет accExt, extSeq, extSeen и
+    // extLastRxMs из задачи Wi-Fi. Если читать их по отдельности, nExt и суммы
+    // могут разойтись, а extSeq/extSeen — не совпасть с показанным средним.
+    // Кольцо extBuf снимаем той же блокировкой, чтобы extPoints и последняя
+    // точка относились к одному состоянию.
+    MinAcc   extAcc;
+    bool     extSeenSnap;
+    uint32_t extSeqSnap;
+    uint32_t extLastRx;
+    int      eh = 0, ec = 0;
+    ExtAvg   lastExt{};
     portENTER_CRITICAL(&extMux);
-    alive = extSeen && (millis() - extLastRxMs < 15UL * 60UL * 1000UL);
-    if (extSeen)
-      ago = (uint32_t)((millis() - extLastRxMs) / 1000UL);
+    extAcc      = accExt;
+    extSeenSnap = extSeen;
+    extSeqSnap  = extSeq;
+    extLastRx   = extLastRxMs;
+    eh          = extHead;
+    ec          = extCount;
+    if (ec > 0)
+      lastExt = extBuf[(eh - 1 + MAX_EXT_PTS) % MAX_EXT_PTS];
     portEXIT_CRITICAL(&extMux);
+
+    uint32_t nowMs = millis();
+    bool     alive = extSeenSnap && (nowMs - extLastRx < 15UL * 60UL * 1000UL);
+    uint32_t ago   = extSeenSnap ? (uint32_t)((nowMs - extLastRx) / 1000UL) : 0;
     doc["extOnline"]  = alive;
-    doc["extSeen"]    = extSeen;
+    doc["extSeen"]    = extSeenSnap;
     doc["extAgoSec"]  = ago;
-    doc["extSeq"]     = extSeq;
+    doc["extSeq"]     = extSeqSnap;
     doc["extPoints"]  = ec;
     JsonObject ep     = doc["ext"].to<JsonObject>();
     if (ec > 0) {
-      ExtAvg a = extGet((eh - 1 + MAX_EXT_PTS) % MAX_EXT_PTS);
-      ep["t"]     = a.t;
-      ep["h"]     = a.h;
-      ep["p"]     = a.p;
-      ep["batt"]  = a.b;
-      ep["ts"]    = a.ts;
+      ep["t"]     = lastExt.t;
+      ep["h"]     = lastExt.h;
+      ep["p"]     = lastExt.p;
+      ep["batt"]  = lastExt.b;
+      ep["ts"]    = lastExt.ts;
     } else {
       // свежий усреднённый пакет ещё не закрылся минутой — показываем аккумуляторы
-      uint16_t n = accExt.nExt;
+      uint16_t n = extAcc.nExt;
       if (alive && n > 0) {
-        ep["t"]    = accExt.t / n;
-        ep["h"]    = accExt.h / n;
-        ep["p"]    = accExt.p / n;
-        ep["batt"] = accExt.b / n;
+        ep["t"]    = extAcc.t / n;
+        ep["h"]    = extAcc.h / n;
+        ep["p"]    = extAcc.p / n;
+        ep["batt"] = extAcc.b / n;
       } else {
         ep["t"]   = nullptr;
         ep["h"]   = nullptr;
@@ -988,30 +1131,28 @@ struct HPoint {
 
 // co2 == 0 — служебный признак «валидного замера не было» (датчик отключён,
 // идёт прогрев или все чтения забракованы). В JSON отдаём null, чтобы
-// график/таблица не показывали ложный 0 ppm.
+// график/таблица не показывали ложный 0 ppm. Так же поступаем с T/H: NaN
+// (DHT не ответил) уходит как null, а не как строка "nan".
 static void fmtPoint(char *buf, size_t n, const HPoint &p) {
   char dt[24];
   fmtTimeBuf(p.ts, dt, sizeof(dt));
+  char tBuf[16], hBuf[16];
+  if (isfinite(p.t))
+    snprintf(tBuf, sizeof(tBuf), "%.1f", p.t);
+  else
+    strcpy(tBuf, "null");
+  if (isfinite(p.h))
+    snprintf(hBuf, sizeof(hBuf), "%.1f", p.h);
+  else
+    strcpy(hBuf, "null");
   if (p.co2)
     snprintf(buf, n,
-             "{\"ts\":%lu,\"dt\":\"%s\",\"t\":%.1f,\"h\":%.1f,\"co2\":%u}",
-             (unsigned long)p.ts, dt, p.t, p.h, p.co2);
+             "{\"ts\":%lu,\"dt\":\"%s\",\"t\":%s,\"h\":%s,\"co2\":%u}",
+             (unsigned long)p.ts, dt, tBuf, hBuf, p.co2);
   else
     snprintf(buf, n,
-             "{\"ts\":%lu,\"dt\":\"%s\",\"t\":%.1f,\"h\":%.1f,\"co2\":null}",
-             (unsigned long)p.ts, dt, p.t, p.h);
-}
-
-// Складывает одну точку JSON в строку. Раньше это писалось в AsyncResponseStream,
-// но тот отдаёт тело побайтово (StreamString::read -> remove(0,1)), т.е. за O(n^2):
-// на ответе в десятки КБ задача async_tcp не успевала сбросить watchdog -> abort.
-static void appendPoint(String &out, const HPoint &p, bool &first) {
-  if (!first)
-    out += ',';
-  first = false;
-  char buf[160];
-  fmtPoint(buf, sizeof(buf), p);
-  out += buf;
+             "{\"ts\":%lu,\"dt\":\"%s\",\"t\":%s,\"h\":%s,\"co2\":null}",
+             (unsigned long)p.ts, dt, tBuf, hBuf);
 }
 
 // Средние внешнего блока (для /api/ext_history): кольцо + снимок.
@@ -1034,9 +1175,9 @@ static void extPointsSince(uint32_t since, ExtPt *out, int maxOut, int &nOut) {
 }
 
 static void sendExtHistory(AsyncWebServerRequest *req, uint32_t since) {
-  static ExtPt g_extOut[MAX_HISTORY_OUT];
+  static ExtPt g_extOut[MAX_EXT_PTS];
   int n = 0;
-  extPointsSince(since, g_extOut, MAX_HISTORY_OUT, n);
+  extPointsSince(since, g_extOut, MAX_EXT_PTS, n);
   // Тело собираем в String и отдаём через AsyncBasicResponse (req->send): он копирует
   // данные чанками, а не по одному байту, и не блокирует async_tcp дольше watchdog.
   String out;
@@ -1058,55 +1199,93 @@ static void sendExtHistory(AsyncWebServerRequest *req, uint32_t since) {
   req->send(200, "application/json", out.c_str());
 }
 
-static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
-  static HPoint g_sinceOut[MAX_HISTORY_OUT];
-  int lh, lc;
-  liveSnapshot(lh, lc);
-  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
-
-  // Инкремент: все новые точки без прореживания (обычно 0–1 точек за 5 мин).
-  int outCount = 0;
-  for (int i = 0; i < lc && outCount < MAX_HISTORY_OUT; i++) {
-    Point sp = liveGet((start + i) % MAX_LIVE_POINTS);
-    if (sp.ts <= since)
-      continue;
-    g_sinceOut[outCount++] = HPoint{sp.ts, sp.t, sp.h, sp.co2};
-  }
-
-  String out;
-  out.reserve(16 + (size_t)outCount * 96);
-  out += '[';
-  bool firstItem = true;
-  for (int i = 0; i < outCount; i++)
-    appendPoint(out, g_sinceOut[i], firstItem);
-  out += ']';
-  req->send(200, "application/json", out.c_str());
-}
-
 // ---------- Предзагрузка истории из файлов ----------
 // Обработчик /api/history работает только с ОЗУ: длинное чтение флеша внутри
 // задачи async_tcp роняло устройство по сторожевому таймеру (task_wdt -> abort).
 // Чтобы график не был пустым сразу после перезагрузки, при старте один раз
-// заполняем кольцо liveBuf последними MAX_LIVE_POINTS пятиминутными строками.
+// заполняем кольцо liveBuf последними MAX_LIVE_POINTS строками (старый формат
+// пятиминутных средних читается так же, как новый с переменным шагом).
 // Чтение — крупными блоками (как countFileRows), поэтому старт не тормозит.
+
+// Поле CSV: пусто, "nan"/"NaN", мусор после числа или значение вне
+// физического диапазона — нет замера (NaN). Так старые файлы с "nan" и новые
+// с пустым полем читаются одинаково.
+static float parseCsvFloat(const char *s, float lo, float hi) {
+  while (*s == ' ' || *s == '\t')
+    s++;
+  if (!*s || *s == ',' || ((s[0] == 'n' || s[0] == 'N') &&
+                           (s[1] == 'a' || s[1] == 'A') &&
+                           (s[2] == 'n' || s[2] == 'N')))
+    return NAN;
+  char *end = nullptr;
+  float v   = strtof(s, &end);
+  if (end == s || !isfinite(v) || v < lo || v > hi)
+    return NAN;
+  while (*end == ' ' || *end == '\t')
+    end++;
+  if (*end != ',' && *end != '\0' && *end != '\r')
+    return NAN; // хвост после числа — повреждённая строка
+  return v;
+}
+
+// CO2 — целое поле; 0 или мусор означают «валидного замера не было».
+static uint16_t parseCsvCo2(const char *s) {
+  while (*s == ' ' || *s == '\t')
+    s++;
+  if (!*s || *s == ',')
+    return 0;
+  char *end = nullptr;
+  long  v   = strtol(s, &end, 10);
+  if (end == s || v <= 0 || v > 5000)
+    return 0;
+  while (*end == ' ' || *end == '\t' || *end == '\r')
+    end++;
+  if (*end != '\0' && *end != ',')
+    return 0; // хвост после числа — повреждённая строка
+  return (uint16_t)v;
+}
+
 static void preloadLiveFromFlash() {
   static String names[MAX_LIST_FILES];
   int nf = listFiles(LOGS_DIR, names, MAX_LIST_FILES);
   sortNames(names, nf);
 
-  static HPoint  tmp[MAX_LIVE_POINTS];
   static uint8_t chunk[512];
   static char    line[176];
-  int            cnt = 0;
+  int            total = 0;
+
+  // Кольцу нужны только последние 24 ч. Читаем не все 20 файлов, а несколько
+  // самых новых: даже при спокойных сутках (864 точки) двух дней хватает с
+  // запасом, а старт не перебирает весь флеш.
+  int mainFiles = 0;
+  for (int i = 0; i < nf; i++)
+    if (!isExtLogFile(names[i]))
+      mainFiles++;
+  int skipMain = (mainFiles > PRELOAD_MAX_FILES) ? (mainFiles - PRELOAD_MAX_FILES) : 0;
+
+  // Если RTC уже знает время, отбрасываем строки старше суток. Если нет —
+  // полагаемся на размер кольца: оно само оставит только последние точки.
+  uint32_t nowTs  = (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0;
+  uint32_t cutoff = (nowTs > 24UL * 3600UL) ? (nowTs - 24UL * 3600UL) : 0;
+
+  // Пишем сразу в кольцо: при переполнении новая строка затирает самую старую
+  // и memmove на 1200 элементах не нужен. setup(), сервер ещё не запущен.
+  liveHead  = 0;
+  liveCount = 0;
 
   for (int i = 0; i < nf; i++) {
     if (isExtLogFile(names[i]))
       continue;
+    if (skipMain > 0) {
+      skipMain--;
+      continue;
+    }
     File f = LittleFS.open(names[i], "r");
     if (!f)
       continue;
-    size_t ll     = 0;
-    bool   header = true;
+    size_t ll       = 0;
+    bool   header   = true;
+    bool   skipLine = false;
     while (true) {
       int n = f.read(chunk, sizeof(chunk));
       if (n <= 0)
@@ -1116,11 +1295,21 @@ static void preloadLiveFromFlash() {
         if (c == '\r')
           continue;
         if (c != '\n') {
-          if (ll < sizeof(line) - 1)
+          if (skipLine)
+            continue;
+          if (ll < sizeof(line) - 1) {
             line[ll++] = c;
-          else
-            ll = 0; // слишком длинная строка — пропускаем
+          } else {
+            ll       = 0;
+            skipLine = true; // слишком длинная строка — пропускаем целиком
+          }
           continue;
+        }
+        bool wasSkipped = skipLine;
+        skipLine        = false;
+        if (wasSkipped) {
+          header = false;
+          continue; // не разбираем хвост длинной строки как новую запись
         }
         if (!ll)
           continue;
@@ -1130,9 +1319,16 @@ static void preloadLiveFromFlash() {
           header = false;
           continue;
         }
-        uint32_t ts = (uint32_t)strtoul(line, nullptr, 10);
-        if (!ts)
-          continue;
+
+        char      *endTs = nullptr;
+        uint32_t   ts    = (uint32_t)strtoul(line, &endTs, 10);
+        if (endTs == line || *endTs != ',' || ts == 0)
+          continue; // битая метка времени
+        if (nowTs && (ts > nowTs + 86400UL))
+          continue; // время из будущего — повреждённая строка
+        if (cutoff && ts < cutoff)
+          continue; // старше 24 ч
+
         char *c1 = strchr(line, ',');
         if (!c1)
           continue;
@@ -1145,86 +1341,265 @@ static void preloadLiveFromFlash() {
         char *c4 = strchr(c3 + 1, ','); // всё после — CO2
         if (!c4)
           continue;
-        HPoint p{ts, (float)atof(c2 + 1), (float)atof(c3 + 1), (uint16_t)atoi(c4 + 1)};
-        if (cnt < MAX_LIVE_POINTS) {
-          tmp[cnt++] = p;
-        } else { // держим только последние MAX_LIVE_POINTS строк
-          memmove(tmp, tmp + 1, (MAX_LIVE_POINTS - 1) * sizeof(HPoint));
-          tmp[MAX_LIVE_POINTS - 1] = p;
-        }
+
+        Point &p = liveBuf[liveHead];
+        p.ts     = ts;
+        p.t      = parseCsvFloat(c2 + 1, -60.0f, 80.0f);
+        p.h      = parseCsvFloat(c3 + 1, 0.0f, 100.0f);
+        // FPCS считает h <= 0 отсутствием замера (старые файлы писали туда 0,
+        // когда DHT не ответил). В JSON 0.0 выглядел бы как реальные 0 %.
+        if (!(p.h > 0.0f))
+          p.h = NAN;
+        p.co2    = parseCsvCo2(c4 + 1);
+        liveHead = (liveHead + 1) % MAX_LIVE_POINTS;
+        if (liveCount < MAX_LIVE_POINTS)
+          liveCount++;
+        total++;
       }
     }
     f.close();
   }
 
-  if (cnt == 0)
+  if (!total)
     return;
 
-  portENTER_CRITICAL(&liveMux);
-  liveHead  = 0;
-  liveCount = 0;
-  for (int i = 0; i < cnt; i++) {
-    Point &p = liveBuf[liveHead];
-    p.ts     = tmp[i].ts;
-    p.t      = tmp[i].t;
-    p.h      = tmp[i].h;
-    p.co2    = tmp[i].co2;
-    liveHead = (liveHead + 1) % MAX_LIVE_POINTS;
-    liveCount++;
-  }
-  portEXIT_CRITICAL(&liveMux);
   pointsSeq++;
 
-  Serial.printf("[HIST] из файлов предзагружено %d точек (последние ~%lu ч)\n",
-                cnt, (unsigned long)((uint32_t)cnt * SAMPLE_PERIOD_SEC / 3600UL));
+  Serial.printf("[HIST] из файлов принято %d точек, в кольце %d (лимит %d)\n",
+                total, liveCount, MAX_LIVE_POINTS);
 }
 
 // ---------- Сборка истории /api/history ----------
-// Только кольцо liveBuf: последние 24 ч пятиминутных средних (MAX_LIVE_POINTS
-// = 288), плюс предзагруженное из файлов при старте. Флеш здесь не читается:
+// Только кольцо liveBuf: последние 24 ч FPCS-точек (MAX_LIVE_POINTS = 1200),
+// плюс предзагруженное из файлов при старте. Флеш здесь не читается:
 // обработчик выполняется в задаче async_tcp, и длинное чтение файлов роняло
-// устройство по сторожевому таймеру. Объём ответа — не больше MAX_HISTORY_OUT
-// точек, т.е. не больше последних 24 ч.
-static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
-  const int maxOut = (lastN > 0) ? lastN : MAX_HISTORY_OUT;
+// устройство по сторожевому таймеру.
+//
+// Ответ отдаётся chunked-генератором. Целая строка даже на 900 точек — это
+// ~50–70 КБ, а AsyncBasicResponse делает ещё одну копию: двух таких блоков
+// подряд в куче ESP32 может не найтись. Генератор пишет по одной точке прямо
+// в буфер сокета и держит только одну строку.
+//
+// Полные сутки дополнительно прореживаются до MAX_HISTORY_OUT (900), если в
+// кольце накопилось больше точек. Прореживание равномерное по времени, но
+// глобальные максимумы CO2 и H сохраняются принудительно: пик не теряется.
+// ?since= и ?points= идут без этого ограничения — это короткие ответы.
+struct HistoryGen {
+  bool     bracketSent = false;
+  bool     ended       = false;
+  bool     firstItem   = true;
+  int      start       = 0; // индекс кольца первой точки
+  int      total       = 0; // всего слотов кольца в ответе
+  int      emitted     = 0; // уже просмотрено слотов
+  int      validRank   = 0; // порядковый номер валидной точки в ответе
+  uint32_t since       = 0; // 0 — без ограничения по времени
+  bool sinceExclusive  = false; // ?since=: строго новее since (ts <= since — пропуск)
+  int      maxOut      = 0; // 0 — без ограничения; 900 — полные сутки
+  int      candCount   = 0; // валидных кандидатов (ts != 0 и не старше since)
+  int      outCount    = 0; // уже отдано точек (жёсткий предел maxOut)
+  uint8_t  keep[MAX_LIVE_POINTS] = {0}; // keep[validRank] при прореживании
+  char     line[176]   = {0};
+  size_t   lineLen     = 0;
+  size_t   linePos     = 0;
+};
 
-  // ---- окно живых средних (кольцо хранит последние 24 ч) ----
+static bool histAccept(const HistoryGen &g, const Point &sp) {
+  if (sp.ts == 0)
+    return false;
+  if (g.since && (g.sinceExclusive ? sp.ts <= g.since : sp.ts < g.since))
+    return false;
+  return true;
+}
+
+// Принудительно оставляет rank. Если слот занят, освобождает ближайший к нему
+// выбранный, кроме otherForced: так при сохранении max CO2 не затирается max H.
+static void histForceRank(HistoryGen &g, int rank, int cand, int otherForced) {
+  if (rank < 0 || rank >= cand || g.keep[rank])
+    return;
+  int best     = -1;
+  int bestDist = 0;
+  for (int r = 0; r < cand; r++) {
+    if (!g.keep[r] || r == otherForced)
+      continue;
+    int d = (r > rank) ? (r - rank) : (rank - r);
+    if (best < 0 || d < bestDist) {
+      best     = r;
+      bestDist = d;
+    }
+  }
+  if (best < 0)
+    return; // некуда вставить, не превышая лимит
+  g.keep[best] = 0;
+  g.keep[rank] = 1;
+}
+
+// Один проход по кольцу: считает кандидатов и строит маску равномерного
+// прореживания. Вызывать до sendChunked, пока live-кольцо не изменилось.
+static void histGenPrepare(HistoryGen &g) {
+  g.candCount = 0;
+  g.validRank = 0;
+  if (!g.maxOut)
+    return;
+
+  int   maxCo2  = -1;
+  float maxH    = -1.0f;
+  int   rankCo2 = -1;
+  int   rankH   = -1;
+  int   rank    = 0;
+  for (int e = 0; e < g.total; e++) {
+    Point sp = liveGet((g.start + e) % MAX_LIVE_POINTS);
+    if (!histAccept(g, sp))
+      continue;
+    if ((int)sp.co2 > maxCo2) {
+      maxCo2  = (int)sp.co2;
+      rankCo2 = rank;
+    }
+    if (isfinite(sp.h) && sp.h > 0.0f && sp.h > maxH) {
+      maxH  = sp.h;
+      rankH = rank;
+    }
+    rank++;
+  }
+  g.candCount = rank;
+  if (rank <= g.maxOut)
+    return; // прореживать нечего
+
+  memset(g.keep, 0, sizeof(g.keep));
+  for (int j = 0; j < g.maxOut; j++) {
+    int r = (int)((int64_t)j * (int64_t)(rank - 1) / (int64_t)(g.maxOut - 1));
+    g.keep[r] = 1;
+  }
+
+  // Глобальные экстремумы важнее равномерности: CO2 — приоритет, H — следом.
+  histForceRank(g, rankCo2, rank, rankH);
+  histForceRank(g, rankH, rank, rankCo2);
+}
+
+// Готовит следующую порцию: '[' / запятую с точкой / ']'.
+// false — ответ закончен. Точки без времени (ts == 0) и старше since
+// пропускаются, но не разрывают ответ.
+static bool histGenBuildLine(HistoryGen &g) {
+  g.linePos = 0;
+  g.lineLen = 0;
+
+  if (!g.bracketSent) {
+    g.bracketSent = true;
+    g.line[0]     = '[';
+    g.lineLen     = 1;
+    return true;
+  }
+
+  while (g.emitted < g.total) {
+    if (g.maxOut && g.outCount >= g.maxOut)
+      break;
+    Point sp = liveGet((g.start + g.emitted) % MAX_LIVE_POINTS);
+    g.emitted++;
+    if (!histAccept(g, sp))
+      continue;
+    int rank = g.validRank++;
+    if (g.maxOut && g.candCount > g.maxOut && !g.keep[rank])
+      continue;
+    char item[160];
+    fmtPoint(item, sizeof(item), HPoint{sp.ts, sp.t, sp.h, sp.co2});
+    int w = g.firstItem
+                ? snprintf(g.line, sizeof(g.line), "%s", item)
+                : snprintf(g.line, sizeof(g.line), ",%s", item);
+    g.firstItem = false;
+    g.outCount++;
+    g.lineLen   = (w > 0) ? strlen(g.line) : 0;
+    return true;
+  }
+
+  if (!g.ended) {
+    g.ended        = true;
+    g.line[0]      = ']';
+    g.lineLen      = 1;
+    return true;
+  }
+  return false;
+}
+
+// Один генератор на ответ: состояние живёт в shared_ptr, захваченном лямбдой
+// sendChunked. Параллельные запросы больше не делят общий histGen и не получают
+// 503 "history busy".
+static size_t historyFiller(HistoryGen &g, uint8_t *buf, size_t maxLen) {
+  size_t n = 0;
+  while (n < maxLen) {
+    if (g.linePos >= g.lineLen) {
+      if (!histGenBuildLine(g))
+        break;
+    }
+    size_t avail = g.lineLen - g.linePos;
+    size_t take  = (avail < maxLen - n) ? avail : (maxLen - n);
+    memcpy(buf + n, g.line + g.linePos, take);
+    g.linePos += take;
+    n += take;
+  }
+  return n;
+}
+
+// Общий chunked-ответ: генератор один на запрос, состояние живёт в shared_ptr,
+// захваченном лямбдой sendChunked. Так полноценные сутки, ?since= и ?points=
+// не собирают тело в String и не делят общий буфер между запросами.
+// maxOut == 0 — без прореживания (короткие ответы), иначе — не больше maxOut.
+static void sendHistoryChunked(AsyncWebServerRequest *req, int start, int total,
+                               uint32_t since, bool sinceExclusive, int maxOut) {
+  auto gen            = std::make_shared<HistoryGen>();
+  gen->start          = start;
+  gen->total          = total;
+  gen->since          = since;
+  gen->sinceExclusive = sinceExclusive;
+  gen->maxOut         = maxOut;
+  histGenPrepare(*gen);
+  req->sendChunked("application/json",
+                   [gen](uint8_t *buf, size_t maxLen, size_t index) -> size_t {
+                     (void)index;
+                     return historyFiller(*gen, buf, maxLen);
+                   });
+}
+
+static void sendHistory(AsyncWebServerRequest *req, uint32_t since, int lastN) {
+  // ---- окно живых точек (кольцо хранит последние 24 ч) ----
   int lh, lc;
   liveSnapshot(lh, lc);
   const int ringStart = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
 
-  int newestFirst = 0;
-  int L           = 0;
-  for (int i = lc - 1; i >= 0; i--) {
-    Point sp = liveGet((ringStart + i) % MAX_LIVE_POINTS);
-    if (sp.ts == 0)
-      break; // точки без времени (до NTP) не участвуют
-    if (since && sp.ts < since)
-      break;
-    if (!L)
-      newestFirst = i; // самая свежая принятая точка
-    L++;
+  // ?points=N (таблица в интерфейсе): последние N валидных точек. Считаем
+  // валидные отдельно, чтобы нулевые ts не съедали лимит и не попадали в ответ.
+  if (lastN > 0) {
+    const int maxOut = lastN;
+    int       valid  = 0;
+    for (int i = 0; i < lc; i++) {
+      Point sp = liveGet((ringStart + i) % MAX_LIVE_POINTS);
+      if (sp.ts != 0)
+        valid++;
+    }
+    int skip    = (valid > maxOut) ? (valid - maxOut) : 0;
+    int startAt = 0; // смещение в кольце первой отдаваемой точки
+    for (int i = 0; i < lc && skip > 0; i++) {
+      Point sp = liveGet((ringStart + i) % MAX_LIVE_POINTS);
+      if (sp.ts != 0)
+        skip--;
+      startAt = i + 1;
+    }
+    sendHistoryChunked(req, (ringStart + startAt) % MAX_LIVE_POINTS, lc - startAt, 0,
+                       false, 0);
+    return;
   }
-  // индекс кольца самой старой принятой живой точки
-  const int liveBegin = (ringStart + newestFirst - L + 1 + MAX_LIVE_POINTS * 2) % MAX_LIVE_POINTS;
 
-  // ---- выбор точек: points=N — последние N, иначе всё окно (<= 24 ч) ----
-  int lFrom = 0, lCount = L;
-  if (lastN > 0 && lCount > maxOut) {
-    lFrom  = L - maxOut;
-    lCount = maxOut;
-  }
+  // Полные сутки (600–900 точек) отдаём chunked-генератором: он пишет по
+  // одной точке прямо в буфер сокета и держит только одну строку. Если за
+  // сутки накопилось больше 900 точек, генератор равномерно прореживает их,
+  // сохраняя глобальные максимумы CO2 и H.
+  sendHistoryChunked(req, ringStart, lc, since, false, MAX_HISTORY_OUT);
+}
 
-  String out;
-  out.reserve(16 + (size_t)lCount * 96);
-  out += '[';
-  bool firstItem = true;
-  for (int i = 0; i < lCount; i++) {
-    Point sp = liveGet((liveBegin + lFrom + i) % MAX_LIVE_POINTS);
-    appendPoint(out, HPoint{sp.ts, sp.t, sp.h, sp.co2}, firstItem);
-  }
-  out += ']';
-  req->send(200, "application/json", out.c_str());
+// ?since= — инкремент: только точки строго новее since (обычно 0–6 за 5 мин).
+static void sendHistorySince(AsyncWebServerRequest *req, uint32_t since) {
+  int lh, lc;
+  liveSnapshot(lh, lc);
+  int start = (lh - lc + MAX_LIVE_POINTS) % MAX_LIVE_POINTS;
+  sendHistoryChunked(req, start, lc, since, true, 0);
 }
 
 // Пересборка кэша. Вызывать только под fsLock: читает каталог и размеры файлов.
@@ -1282,8 +1657,10 @@ static void setupWeb() {
     }
 
     if (req->hasParam("points")) {
+      // Явный запрос последних N точек не прореживается: это не «полные
+      // сутки». Верхняя граница — размер кольца (сутки FPCS, <= 1200).
       int pts = (int)req->getParam("points")->value().toInt();
-      pts     = constrain(pts, 10, MAX_HISTORY_OUT);
+      pts     = constrain(pts, 10, MAX_LIVE_POINTS);
       sendHistory(req, 0, pts);
       return;
     }
@@ -1318,7 +1695,7 @@ static void setupWeb() {
 
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    // Период точки фиксирован: точки — пятиминутные средние (60 замеров по 5 с).
+    // Период окна фиксирован: 5 минут (60 замеров по 5 с), внутри — FPCS.
     // Значение отдаётся для совместимости со старой вкладкой настроек.
     doc["pointSec"]    = DEFAULT_POINT_SEC;
     doc["saveMin"]     = saveIntervalMs / 60000;
@@ -1333,8 +1710,8 @@ static void setupWeb() {
 
   server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *req) {
     if (req->hasParam("pointSec", true)) {
-      // Период точки больше не настраивается: точки — пятиминутные средние.
-      Serial.println("[CFG] период точки фиксирован (300 с), параметр проигнорирован");
+      // Период окна больше не настраивается: окно — 5 минут, точки выбирает FPCS.
+      Serial.println("[CFG] период окна фиксирован (300 с), параметр проигнорирован");
     }
     if (req->hasParam("saveMin", true)) {
       int v          = req->getParam("saveMin", true)->value().toInt();
@@ -1705,7 +2082,6 @@ void setup() {
   readSensors();
   setLatestTs(timeSynced && (time(nullptr) > 1000000) ? (uint32_t)time(nullptr) : 0);
   lastLogMs   = millis();
-  lastPointMs = millis();
   Serial.printf("[INIT] пятиминутные средние, сохранение на флеш пачками по %lu мин\n",
                 saveIntervalMs / 60000);
   Serial.println("[INIT] готово");
@@ -1781,13 +2157,20 @@ void loop() {
     accumulateAvg();
   }
 
-  // Запись на флеш: как только в буфере набралось saveMin минут данных
-  // (по 5 мин на точку, то есть saveMin/5 точек), сбрасываем его в файл.
-  int flushPts = (int)(saveIntervalMs / 60000UL) / (int)(SAMPLE_PERIOD_SEC / 60UL);
-  if (flushPts < 1)
-    flushPts = 1;
-  if (timeSynced && hourCount >= flushPts)
+  // Запись на флеш: как только накопилось saveMin минут данных (по 5 мин на
+  // окно), сбрасываем буфер в файл. hourCount ограничивает пачку по размеру,
+  // если точек FPCS оказалось больше обычного.
+  int flushWindows = (int)(saveIntervalMs / 60000UL) / (int)(SAMPLE_PERIOD_SEC / 60UL);
+  if (flushWindows < 1)
+    flushWindows = 1;
+  bool flushDue = timeSynced && (hourWindows >= flushWindows || hourCount >= FLASH_POINTS_MAX);
+  // Если ФС занята, не долбим fsLock каждые 50 мс: иначе loop() почти всё время
+  // стоит в ожидании блокировки, задерживая датчики и сеть, а лог спамится.
+  static uint32_t lastFlushAttemptMs = 0;
+  if (flushDue && millis() - lastFlushAttemptMs >= FLUSH_RETRY_MS) {
+    lastFlushAttemptMs = millis();
     flushHourToFlash();
+  }
 
   delay(50);
 }

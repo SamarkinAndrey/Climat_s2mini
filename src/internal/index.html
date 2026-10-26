@@ -856,7 +856,8 @@
       const pad = { l: 0, r: 10, t: 16, b: 24 };
 
       // CO2 == null / 0 — «нет валидного замера»: такие точки не рисуем,
-      // а разрываем линию (для t/h 0 — нормальное значение).
+      // а разрываем линию. Для t/h null означает «датчик не ответил», а 0 —
+      // реальное значение, поэтому 0 не отбрасываем.
       const isCo2 = yfield === 'co2';
       const val = d => {
         const raw = d[yfield];
@@ -1068,8 +1069,14 @@
       const started = Date.now();
       try {
         const s = await api('/api/current');
-        $('v-t').innerHTML = s.temperature.toFixed(1);
-        $('v-h').innerHTML = s.humidity.toFixed(1);
+        const fmtTh = v => {
+          // Number(null) === 0, поэтому null/пустое проверяем до приведения.
+          if (v === null || v === undefined || v === '') return '—';
+          const x = Number(v);
+          return Number.isFinite(x) ? x.toFixed(1) : '—';
+        };
+        $('v-t').textContent = fmtTh(s.temperature);
+        $('v-h').textContent = fmtTh(s.humidity);
         const heat = !!s.heating;
         $('v-co2').classList.toggle('heat', heat);
         if (heat) {
@@ -1116,7 +1123,8 @@
       chartsBusy = true;
       try {
         if (full || !hist.length) {
-          // полная сутки: сервер сам прореживает точки до ~300
+          // полные сутки: сервер отдаёт не больше 900 точек (при плотных
+          // данных — равномерно прореженных, с сохранением пиков CO2/H)
           hist = await api('/api/history?hours=' + TOTAL_HOURS);
         } else {
           // догружаем только новые минутные точки
@@ -1130,7 +1138,7 @@
           const cut = last - TOTAL_HOURS * 3600;
           hist = hist.filter(d => Number(d.ts) >= cut);
         }
-        if (hist.length > 600) hist = hist.slice(hist.length - 600);
+        if (hist.length > 900) hist = hist.slice(hist.length - 900);
         markDirty();
         drawAll();
         updateLogBadge();
@@ -1148,10 +1156,10 @@
         const tb = $('tbl').querySelector('tbody'); tb.innerHTML = '';
         const rows = h.slice(-50).reverse();
         let html = '';
-        rows.forEach(d => { html += `<tr><td>${d.dt}</td><td>${d.t.toFixed(1)}</td><td>${d.h.toFixed(1)}</td><td>${d.co2 > 0 ? d.co2 : '—'}</td></tr>`; });
+        rows.forEach(d => { html += `<tr><td>${d.dt}</td><td>${d.t != null ? d.t.toFixed(1) : '—'}</td><td>${d.h != null ? d.h.toFixed(1) : '—'}</td><td>${d.co2 > 0 ? d.co2 : '—'}</td></tr>`; });
         tb.innerHTML = html;
         const shownN = rows.length;
-        const totalN = Math.max(shownN, statsFiles + statsRam);
+        const totalN = Math.max(shownN, statsFiles, statsRam);
         const note = shownN < totalN
           ? ('Показаны последние ' + shownN + ' из ' + totalN + ' записей.')
           : ('Показаны все ' + shownN + ' записей.');
@@ -1329,7 +1337,9 @@
       return h >= 24 ? (' · ' + Math.round(h / 24) + ' сут') : (' · ' + Math.round(h) + ' ч');
     }
     function updateLogBadge() {
-      $('logBadge').textContent = 'Записей: ' + (statsFiles + statsRam) + logSpan();
+      // Файлы и ОЗУ пересекаются (preload кладёт файлы в кольцо), поэтому не
+      // суммируем: показываем оценку объёма, а разбивку — в title.
+      $('logBadge').textContent = 'Записей: ' + Math.max(statsFiles, statsRam) + logSpan();
       $('logBadge').title = 'В файлах: ' + statsFiles + ' · в ОЗУ: ' + statsRam + ' · на графике: ' + hist.length;
     }
     window.addEventListener('resize', () => { markDirty(); drawAll(); });

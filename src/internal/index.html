@@ -952,20 +952,21 @@
         const t1 = Number(data[data.length - 1].ts) || 0;
         const off = serverTzOffset(data);
         const t1Off = t1 + off;
-        const t0Off = t1Off - TOTAL_HOURS * 3600;
-        const alignSec = ((t1Off % 3600) + 3600) % 3600;
-        const t0AlignedOff = t0Off - (alignSec % 3600);
-        const t0 = t0AlignedOff - off;
+        const t1MinSec = ((t1Off % 3600) + 3600) % 3600;
+        const t1HourStartOff = t1Off - t1MinSec;
+        const t0HourStartOff = t1HourStartOff - TOTAL_HOURS * 3600;
+        const t0 = t0HourStartOff - off;
         const span = (t1 > t0) ? (t1 - t0) : 0;
         const X = ts => span ? (pad.l + pw * Math.max(0, Math.min(1, (Number(ts) - t0) / span))) : pad.l + pw / 2;
 
-        // вертикальная сетка по часам с подписями, выровненная по минуте последней точки
+        // вертикальная сетка по часам с подписями, правая подпись совпадает с последней точкой
         g.fillStyle = '#64748b'; g.font = '10px sans-serif';
         for (let i = 0; i <= 24; i++) {
-          const gxOff = t0AlignedOff + i * 3600;
+          const gxOff = t0HourStartOff + i * 3600 + t1MinSec;
           const gx = gxOff - off;
-          if (gx > t1 + 1) break;
-          const x = pad.l + pw * i / 24;
+          if (gx < t0 - 60) continue;
+          if (gx > t1 + 60) continue;
+          const x = span ? (pad.l + pw * Math.max(0, Math.min(1, (gx - t0) / span))) : pad.l + pw * i / 24;
           if (x < pad.l - 1 || x > w - pad.r + 1) continue;
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();

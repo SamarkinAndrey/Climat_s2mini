@@ -836,10 +836,11 @@
       return Math.round((asUTC - (Number(d.ts) || 0) * 1000) / 1000);
     }
 
-    function fmtHour(ts, off) {
+    function fmtTick(ts, off) {
       const d = new Date((ts + off) * 1000);
       const hh = d.getUTCHours();
-      return String(hh).padStart(2, '0') + ':00';
+      const mm = d.getUTCMinutes();
+      return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
     }
 
     function drawChart(cv, ay, color, label, data, yfield, w) {
@@ -949,21 +950,26 @@
 
         // весь диапазон — сутки назад от последней точки
         const t1 = Number(data[data.length - 1].ts) || 0;
-        const t0 = t1 - TOTAL_HOURS * 3600;
+        const off = serverTzOffset(data);
+        const t1Off = t1 + off;
+        const t0Off = t1Off - TOTAL_HOURS * 3600;
+        const alignSec = ((t1Off % 3600) + 3600) % 3600;
+        const t0AlignedOff = t0Off - (alignSec % 3600);
+        const t0 = t0AlignedOff - off;
         const span = (t1 > t0) ? (t1 - t0) : 0;
         const X = ts => span ? (pad.l + pw * Math.max(0, Math.min(1, (Number(ts) - t0) / span))) : pad.l + pw / 2;
 
-        // вертикальная сетка по часам с подписями (ровно 24 часа, равные промежутки)
-        const off = serverTzOffset(data);
+        // вертикальная сетка по часам с подписями, выровненная по минуте последней точки
         g.fillStyle = '#64748b'; g.font = '10px sans-serif';
         for (let i = 0; i <= 24; i++) {
-          const gx = t0 + i * 3600;
+          const gxOff = t0AlignedOff + i * 3600;
+          const gx = gxOff - off;
           if (gx > t1 + 1) break;
           const x = pad.l + pw * i / 24;
           if (x < pad.l - 1 || x > w - pad.r + 1) continue;
           g.beginPath(); g.strokeStyle = '#1e293b'; g.lineWidth = 1;
           g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
-          const lbl = fmtHour(gx, off);
+          const lbl = fmtTick(gx, off);
           const tw = g.measureText(lbl).width;
           let lx = x - tw / 2;
           if (lx < pad.l + 2) lx = pad.l + 2;

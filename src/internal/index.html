@@ -622,6 +622,10 @@
       </div>
       <div class="panel">
         <h2>Последние записи</h2>
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn sec" onclick="flushBuffer()">Записать буфер</button>
+          <span id="flushMsg" style="font-size:12px;color:var(--mut)"></span>
+        </div>
         <div class="tblwrap">
           <table id="tbl">
             <thead>
@@ -1261,6 +1265,19 @@
         // Если нужен мгновенный пересчёт (один запрос к серверу, без flash):
         // loadCharts(true);
       } catch (e) { alert('Ошибка удаления'); }
+    }
+
+    async function flushBuffer() {
+      const m = $('flushMsg');
+      if (m) m.textContent = 'Сохранение...';
+      try {
+        const r = await fetch('/api/flush');
+        const t = await r.text();
+        if (m) m.textContent = t;
+        setTimeout(() => { if (m) m.textContent = ''; loadData(); }, 1500);
+      } catch (e) {
+        if (m) m.textContent = 'Ошибка';
+      }
     }
 
     async function saveWifi() {

@@ -1945,6 +1945,26 @@ static void setupWeb() {
     req->send(200, "text/plain", "Логи удалены");
   });
 
+  server.on("/api/flush", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (hourCount == 0 && extHourCount == 0) {
+      req->send(200, "text/plain", "Буфер пуст");
+      return;
+    }
+    if (pendingWinId == 0) {
+      uint32_t tsf = 0;
+      if (timeSynced && (time(nullptr) > 1000000))
+        tsf = (uint32_t)time(nullptr);
+      if (!tsf && hourCount > 0) tsf = hourBuf[hourCount - 1].ts;
+      if (!tsf && extHourCount > 0) tsf = extHourBuf[extHourCount - 1].ts;
+      if (tsf) pendingWinId = tsf / 300UL;
+    }
+    flushHourToFlash();
+    if (hourCount == 0 && extHourCount == 0)
+      req->send(200, "text/plain", "Сохранено");
+    else
+      req->send(200, "text/plain", "Попробуйте ещё раз");
+  });
+
   server.begin();
 }
 

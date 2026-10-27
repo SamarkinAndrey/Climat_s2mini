@@ -552,6 +552,11 @@ static ExtAvg extGet(int idx) {
   return a;
 }
 
+// Идентификаторы 5-минутного окна для идемпотентного слития в флеш.
+// pendingWinId выставляется при закрытии окна, lastFlushedWinId — после успешной записи.
+static uint32_t pendingWinId     = 0;
+static uint32_t lastFlushedWinId = 0;
+
 // ---------- ESP-NOW: приём пакетов внешнего блока ----------
 // Сигнатура под Arduino-ESP32 core 2.x (esp_now_recv_cb_t): mac, data, len.
 // В core 3.x первым аргументом приходит esp_now_recv_info_t* — см. аудит.
@@ -828,8 +833,15 @@ static void accumulateAvg() {
 
   // Счётчик окон не зависит от наличия внутренних датчиков: иначе внешний
   // лог не сбрасывался бы никогда, если DHT/MH-Z19 молчат (P2.2).
-  if (closedWithData)
+  if (closedWithData) {
     hourWindows++;
+    // ID окна по границе 5 минут. Используется для идемпотентного flushHourToFlash().
+    uint32_t winTs = ts;
+    if (!winTs && rawCount == 0 && hourCount > 0)
+      winTs = hourBuf[hourCount - 1].ts;
+    if (winTs)
+      pendingWinId = winTs / 300UL;
+  }
 
   accN = 0;
   portENTER_CRITICAL(&extMux);
@@ -839,6 +851,15 @@ static void accumulateAvg() {
 
 // Запись пачки FPCS-точек на флеш (обычно 2–3 точки на 5 мин).
 static void flushHourToFlash() {
+  // Если окно уже слито ранее — просто очищаем буферы, чтобы retry больше не дублировал
+  if (pendingWinId != 0 && pendingWinId == lastFlushedWinId) {
+    hourCount    = 0;
+    hourWindows  = 0;
+    extHourCount = 0;
+    pendingWinId = 0;
+    return;
+  }
+
   bool locked = fsLock(500);
   if (!locked) {
     Serial.println("[LOG] ФС занята, сброс часа отложен");
@@ -847,7 +868,18 @@ static void flushHourToFlash() {
   if (!LittleFS.exists(LOGS_DIR))
     LittleFS.mkdir(LOGS_DIR);
 
-  bool wrote = false;
+  // Повторная проверка под блокировкой
+  if (pendingWinId != 0 && pendingWinId == lastFlushedWinId) {
+    hourCount    = 0;
+    hourWindows  = 0;
+    extHourCount = 0;
+    pendingWinId = 0;
+    fsUnlock();
+    return;
+  }
+
+  bool wroteMain = false;
+  bool wroteExt  = false;
 
   if (hourCount > 0) {
     String path    = todayFile();
@@ -884,9 +916,9 @@ static void flushHourToFlash() {
       logRowsTotal += hourCount;
       cacheAddPath(path, written, false); // размер обновляем без чтения флеша
       Serial.printf("[LOG] сброс буфера: %u строк в %s\n", hourCount, path.c_str());
-      hourCount   = 0;
-      hourWindows = 0;
-      wrote       = true;
+      hourCount    = 0;
+      hourWindows  = 0;
+      wroteMain    = true;
     } else {
       Serial.println("[LOG] ошибка открытия файла, сброс отложен");
     }
@@ -916,12 +948,19 @@ static void flushHourToFlash() {
       cacheAddPath(path, written, true);
       Serial.printf("[LOG] сброс буфера ext: %u строк в %s\n", extHourCount, path.c_str());
       extHourCount = 0;
-      wrote        = true;
+      wroteExt     = true;
     }
   }
 
-  if (wrote)
-    lastLogMs = millis();
+  if (wroteMain || wroteExt) {
+    if (pendingWinId != 0)
+      lastFlushedWinId = pendingWinId;
+    pendingWinId = 0;
+    lastLogMs    = millis();
+  } else if (pendingWinId != 0) {
+    lastFlushedWinId = pendingWinId;
+    pendingWinId     = 0;
+  }
 
   rotateLogsIfNeeded();
   fsUnlock();

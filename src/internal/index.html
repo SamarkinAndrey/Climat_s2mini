@@ -1039,29 +1039,38 @@
           }
         }
 
-        if (segs.length > 1) {
+        if (segs.length >= 1) {
           g.save();
           g.setLineDash([3, 3]);
           g.strokeStyle = '#64748b';
           g.lineWidth = 1;
           g.beginPath();
-   
-          if (segs.length > 0) {
+
+          if (segs.length === 1) {
+            const startPt = segs[0][0];
+            if (startPt && startPt[0] > pad.l + 2) {
+              g.moveTo(startPt[0], startPt[1]);
+              g.lineTo(startPt[0], pad.t + ph);
+            }
+          } else {
+            // Несколько блоков — только первый слева, границы между блоками
             const firstStart = segs[0][0];
-            if (firstStart[0] > pad.l + 1) {
+            if (firstStart && firstStart[0] > pad.l + 2) {
               g.moveTo(firstStart[0], firstStart[1]);
               g.lineTo(firstStart[0], pad.t + ph);
             }
-          }
-   
-          for (let k = 1; k < segs.length; k++) {
-            const prevEnd = segs[k - 1][segs[k - 1].length - 1];
-            const nextStart = segs[k][0];
-
-            g.moveTo(prevEnd[0], prevEnd[1]);
-            g.lineTo(prevEnd[0], pad.t + ph);
-            g.moveTo(nextStart[0], nextStart[1]);
-            g.lineTo(nextStart[0], pad.t + ph);
+            for (let k = 1; k < segs.length; k++) {
+              const prevEnd = segs[k - 1][segs[k - 1].length - 1];
+              const nextStart = segs[k][0];
+              if (prevEnd) {
+                g.moveTo(prevEnd[0], prevEnd[1]);
+                g.lineTo(prevEnd[0], pad.t + ph);
+              }
+              if (nextStart && nextStart[0] < w - pad.r - 2) {
+                g.moveTo(nextStart[0], nextStart[1]);
+                g.lineTo(nextStart[0], pad.t + ph);
+              }
+            }
           }
 
           g.stroke();

@@ -880,6 +880,7 @@ static void flushHourToFlash() {
 
   bool wroteMain = false;
   bool wroteExt  = false;
+  bool hadData   = (hourCount > 0 || extHourCount > 0);
 
   if (hourCount > 0) {
     String path    = todayFile();
@@ -957,10 +958,10 @@ static void flushHourToFlash() {
       lastFlushedWinId = pendingWinId;
     pendingWinId = 0;
     lastLogMs    = millis();
-  } else if (pendingWinId != 0) {
+  } else if (pendingWinId != 0 && !hadData) {
     lastFlushedWinId = pendingWinId;
     pendingWinId     = 0;
-  }
+  } // Если были данные, но запись не удалась — не помечаем окно как слитое, повторим позже
 
   rotateLogsIfNeeded();
   fsUnlock();

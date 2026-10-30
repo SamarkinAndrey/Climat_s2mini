@@ -115,17 +115,36 @@
     }
 
     @keyframes tabInL {
-      from { transform: translateX(-28px); opacity: .3 }
-      to { transform: none; opacity: 1 }
+      from {
+        transform: translateX(-28px);
+        opacity: .3
+      }
+
+      to {
+        transform: none;
+        opacity: 1
+      }
     }
 
     @keyframes tabInR {
-      from { transform: translateX(28px); opacity: .3 }
-      to { transform: none; opacity: 1 }
+      from {
+        transform: translateX(28px);
+        opacity: .3
+      }
+
+      to {
+        transform: none;
+        opacity: 1
+      }
     }
 
-    .tab.active.anim-l { animation: tabInL .22s cubic-bezier(.22,.61,.36,1) }
-    .tab.active.anim-r { animation: tabInR .22s cubic-bezier(.22,.61,.36,1) }
+    .tab.active.anim-l {
+      animation: tabInL .22s cubic-bezier(.22, .61, .36, 1)
+    }
+
+    .tab.active.anim-r {
+      animation: tabInR .22s cubic-bezier(.22, .61, .36, 1)
+    }
 
     .metric {
       padding: 12px
@@ -198,7 +217,8 @@
       flex: 0 0 44px;
       width: 44px;
       display: block;
-      overflow: visible /* чтобы подпись могла вылезать вправо поверх графика */
+      overflow: visible
+        /* чтобы подпись могла вылезать вправо поверх графика */
     }
 
     .chart-scroll {
@@ -679,7 +699,6 @@
     function showTab(t, dir) {
       const prev = currentTab;
       currentTab = t;
-      // если направление не задано (клик по кнопке) — выводим из порядка вкладок
       if (dir === undefined) {
         const a = tabIndex(prev), b = tabIndex(t);
         dir = (b === a) ? 0 : (b > a ? -1 : 1);
@@ -698,8 +717,6 @@
       navScrollToActive(!!dir);
     }
 
-    // Активная вкладка в шапке должна быть видна целиком — доводим шапку до неё.
-    // При свайпе/клике плавно, при загрузке страницы мгновенно.
     function navScrollToActive(smooth) {
       const nav = document.querySelector('nav');
       const btn = nav && nav.querySelector('button.active');
@@ -713,8 +730,6 @@
     }
     window.addEventListener('resize', () => navScrollToActive(false));
 
-    // Свайп влево/вправо переключает вкладки. Навигацию (шапку) не трогаем —
-    // её горизонтальный скролл должен работать как обычно.
     const TAB_ORDER = Array.from(document.querySelectorAll('nav button')).map(b => b.dataset.tab);
     let swX = 0, swY = 0, swStartTab = null, swTrack = false, swDragging = false, swEl = null;
     function tabIndex(t) { const i = TAB_ORDER.indexOf(t); return i < 0 ? 0 : i; }
@@ -736,7 +751,7 @@
       if (t && t.closest && t.closest('.chart-scroll')) { swTrack = false; swEl = null; return; }
       const dx = e.touches[0].clientX - swX;
       const dy = e.touches[0].clientY - swY;
-      if (!swDragging && Math.abs(dx) < Math.abs(dy) * 1.2) return; // вертикальный жест — не мешаем скроллу
+      if (!swDragging && Math.abs(dx) < Math.abs(dy) * 1.2) return;
       swDragging = true;
       e.preventDefault();
       const i = tabIndex(swStartTab) + (dx < 0 ? 1 : -1);
@@ -772,9 +787,7 @@
       co2: { cv: 'ch-co2', ay: 'cy-co2', sc: 'cs-co2', box: 'c-co2', ar: 'ar-co2', color: '#22c55e', label: 'ppm', field: 'co2' }
     };
     let openCharts = { t: false, h: false, co2: false };
-
-    // График: с сервера берём сутки, в окне видно 6 часов, остальное — прокруткой.
-    const TOTAL_HOURS   = 24;
+    const TOTAL_HOURS = 24;
     const VISIBLE_HOURS = 6;
 
     function chartJobs() {
@@ -783,14 +796,12 @@
         if (!openCharts[k]) continue;
         const m = MET[k], cv = $(m.cv), sc = $(m.sc); if (!cv || !sc) continue;
         const cw = Math.max(160, sc.clientWidth || 300);
-        const w = Math.round(cw * TOTAL_HOURS / VISIBLE_HOURS); // холст в 4 раза шире экрана
+        const w = Math.round(cw * TOTAL_HOURS / VISIBLE_HOURS);
         jobs.push({ cv, ay: $(m.ay), sc, w, m });
       }
       return jobs;
     }
 
-    // Графики перерисовываются только когда реально что-то изменилось:
-    // пришли новые данные, график открыт/закрыт, изменился размер или прокрутка.
     let chartDirty = true;
     function markDirty() { chartDirty = true; }
 
@@ -799,7 +810,6 @@
       if (!chartDirty) return;
       chartDirty = false;
       const jobs = chartJobs();
-      // запоминаем, был ли пользователь на правом краю — тогда прокрутку держим
       for (const j of jobs)
         j.wasEnd = !j.sc.dataset.init || (j.sc.scrollLeft + j.sc.clientWidth >= j.sc.scrollWidth - 5);
       for (const j of jobs) drawChart(j.cv, j.ay, j.m.color, j.m.label, hist, j.m.field, j.w);
@@ -824,13 +834,10 @@
       saveUi();
     }
 
-    // Разрыв в данных: если между соседними точками больше 10 минут —
-    // линия через пропуск не рисуется, а сам пропуск помечается.
     const GAP_SEC = 600;
-    const AXIS_W  = 44; // ширина шкалы значений (не прокручивается)
+    const AXIS_W = 44;
 
-    // Смещение часового пояса сервера (сек) — вычисляется по dt первой точки,
-    // чтобы подписи времени совпадали с часами самого устройства.
+
     function serverTzOffset(data) {
       if (!data.length) return 0;
       const d = data[0];
@@ -857,12 +864,10 @@
       if (cv.style.width !== w + 'px') cv.style.width = w + 'px';
       if (cv.style.height !== h + 'px') cv.style.height = h + 'px';
       const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
-      g.lineJoin = 'round'; g.lineCap  = 'round';
+      g.lineJoin = 'round'; g.lineCap = 'round';
       const pad = { l: 0, r: 10, t: 16, b: 24 };
 
-      // CO2 == null / 0 — «нет валидного замера»: такие точки не рисуем,
-      // а разрываем линию. Для t/h null означает «датчик не ответил», а 0 —
-      // реальное значение, поэтому 0 не отбрасываем.
+
       const isCo2 = yfield === 'co2';
       const val = d => {
         const raw = d[yfield];
@@ -879,9 +884,7 @@
         if (v < min) min = v; if (v > max) max = v;
       }
 
-      // Ось Y: шаг постоянный — 5 для температуры/влажности, 100 для CO2.
-      // Базово 5 диапазонов (6 подписей). Если данные выходят за них,
-      // количество диапазонов/подписей растёт, а шаг остаётся прежним.
+
       let step, intervals;
       if (!isFinite(min) || !isFinite(max)) {
         min = isCo2 ? 400 : (yfield === 'h' ? 20 : 10);
@@ -897,13 +900,12 @@
       } else {
         step = 5;
         const span = max - min;
-        // для узкого разброса — базовые 5 диапазонов; для широкого добавляем
-        // диапазоны с запасом, чтобы данные оставались примерно в середине
+
         intervals = Math.max(5, Math.ceil(span / step) + (span > step * 4 ? 2 : 0));
-        const width  = intervals * step;
+        const width = intervals * step;
         const center = (min + max) / 2;
         let lo = Math.round((center - width / 2) / step) * step;
-        if (min < lo) lo = Math.floor(min / step) * step;        // данные влезают слева
+        if (min < lo) lo = Math.floor(min / step) * step;
         if (max > lo + width) lo = Math.ceil((max - width) / step) * step;
         min = lo;
         max = lo + width;
@@ -911,48 +913,36 @@
       const ticks = [];
       for (let i = 0; i <= intervals; i++) ticks.push(min + i * step);
       const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
-
-      // ---- шкала значений: отдельный canvas, не уезжает при прокрутке ----
       if (ay) {
-        // Ось Y имеет ширину AXIS_W, но подпись единиц должна лежать на графике
-        // (как раньше: pad.l + 4, 11). Поэтому канвас оси делаем шире на
-        // AXIS_W + 40px, а сам холст графика «начинается» с координаты AXIS_W.
-        // Цифры рисуем в правой части (выровнены по правому краю оси),
-        // подпись единиц — на AXIS_W + 4, то есть ровно на начале графика.
-        const AW = AXIS_W + 40; // запас, чтобы подпись «°C»/«ppm» не обрезалась
+
+
+
+
+        const AW = AXIS_W + 40;
         if (ay.width !== Math.round(AW * dpr) || ay.height !== H) {
           ay.width = Math.round(AW * dpr); ay.height = H;
         }
         if (ay.style.height !== h + 'px') ay.style.height = h + 'px';
-        // канвас визуально шире колонки, но тянется от левого края.
         if (ay.style.width !== AW + 'px') ay.style.width = AW + 'px';
         if (ay.style.marginRight !== (-40) + 'px') ay.style.marginRight = '-40px';
 
         const a = ay.getContext('2d');
         a.setTransform(dpr, 0, 0, dpr, 0, 0); a.clearRect(0, 0, AW, h);
-
-        // цифры шкалы — справа, как и раньше (AXIS_W - 4)
         a.fillStyle = '#94a3b8'; a.font = '11px sans-serif'; a.textAlign = 'right';
         for (const v of ticks) {
           const y = pad.t + ph * (1 - (v - min) / (max - min));
           a.fillText(v.toFixed(0), AXIS_W - 4, y + 4);
         }
 
-        // подпись единиц — в той же точке, что и раньше (pad.l + 4, 11),
-        // но на неподвижной оси. Так она не уезжает при прокрутке графика.
         a.fillStyle = '#e2e8f0'; a.font = '12px sans-serif'; a.textAlign = 'left';
         a.fillText(label, AXIS_W + 4, pad.t - 7);
       }
-
-      // ---- сетка: горизонтальные линии + значения (на шкале) ----
       g.lineWidth = 1; g.strokeStyle = '#334155'; g.font = '11px sans-serif';
       for (const v of ticks) {
         const y = pad.t + ph * (1 - (v - min) / (max - min));
         g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
       }
       if (data.length) {
-
-        // весь диапазон — сутки назад от последней точки
         const t1 = Number(data[data.length - 1].ts) || 0;
         const off = serverTzOffset(data);
         const t1Off = t1 + off;
@@ -962,8 +952,6 @@
         const t0 = t0HourStartOff - off;
         const span = (t1 > t0) ? (t1 - t0) : 0;
         const X = ts => span ? (pad.l + pw * Math.max(0, Math.min(1, (Number(ts) - t0) / span))) : pad.l + pw / 2;
-
-        // вертикальная сетка по часам с подписями, правая подпись совпадает с последней точкой
         g.fillStyle = '#64748b'; g.font = '10px sans-serif';
         for (let i = 0; i <= 24; i++) {
           const gxOff = t0HourStartOff + i * 3600 + t1MinSec;
@@ -981,14 +969,12 @@
           if (lx > w - pad.r - tw - 2) lx = w - pad.r - tw - 2;
           g.fillText(lbl, lx, h - 8);
         }
-
-        // режем данные на сегменты: разрыв > GAP_SEC разрывает линию
         const segs = [];
         let seg = [], prevTs = 0;
         for (let i = 0; i < data.length; i++) {
           const d = data[i];
           const v = val(d);
-          if (v === null) { // нет данных — закрываем сегмент, линию не тянем
+          if (v === null) {
             if (seg.length) segs.push(seg);
             seg = []; prevTs = 0;
             continue;
@@ -1010,7 +996,6 @@
           g.moveTo(s[0][0], s[0][1]);
           for (let i = 1; i < s.length; i++) g.lineTo(s[i][0], s[i][1]);
           g.stroke();
-          // заливка под линией — отдельно по каждому сегменту
           if (s.length > 1) {
             g.lineTo(s[s.length - 1][0], pad.t + ph);
             g.lineTo(s[0][0], pad.t + ph);
@@ -1018,24 +1003,21 @@
             g.fillStyle = color + '22'; g.fill();
           }
         }
-        // штриховая линия на месте разрыва — видно, что данных не было
-        // g.save();
-        // g.setLineDash([3, 3]); g.strokeStyle = '#64748b'; g.lineWidth = 1;
-        // for (let k = 1; k < segs.length; k++) {
-        //   const x = segs[k][0][0];
-        //   if (!isFinite(x)) continue;
-        //   g.beginPath(); g.moveTo(x, pad.t); g.lineTo(x, pad.t + ph); g.stroke();
-        // }
-        // g.restore();
+
+
+
+
+
+
+
+
 
         for (const s of segs) {
           if (s.length === 1) {
             const x = s[0][0], y = s[0][1];
             if (!isFinite(x) || !isFinite(y)) continue;
-            // заливка «под точкой» — полоса шириной с линию, от точки до низа
             g.fillStyle = color + '22';
             g.fillRect(x - lineW / 2, y, lineW, pad.t + ph - y);
-            // сама точка — диаметр = ширине линии
             g.beginPath();
             g.arc(x, y, lineW / 2, 0, Math.PI * 2);
             g.fillStyle = color;
@@ -1057,7 +1039,6 @@
               g.lineTo(startPt[0], pad.t + ph);
             }
           } else {
-            // Несколько блоков — только первый слева, границы между блоками
             const firstStart = segs[0][0];
             if (firstStart && firstStart[0] > pad.l + 2) {
               g.moveTo(firstStart[0], firstStart[1]);
@@ -1090,7 +1071,6 @@
       try {
         const s = await api('/api/current');
         const fmtTh = v => {
-          // Number(null) === 0, поэтому null/пустое проверяем до приведения.
           if (v === null || v === undefined || v === '') return '—';
           const x = Number(v);
           return Number.isFinite(x) ? x.toFixed(1) : '—';
@@ -1102,7 +1082,7 @@
         if (heat) {
           $('v-co2').innerHTML = '♨️';
           let hl = Math.round(Number(s.heatLeft) || 0);
-          if (!(hl >= 0 && hl <= 600)) hl = 0; // защита от мусора в конце прогрева
+          if (!(hl >= 0 && hl <= 600)) hl = 0;
           $('s-mhz').innerHTML = '<span class="heat">идёт прогрев, ' + hl + ' с</span>';
         } else {
           const co2 = Number(s.co2);
@@ -1132,7 +1112,7 @@
       } catch (e) { }
       pollNextAt = started + POLL_MS;
       const wait = Math.max(0, pollNextAt - Date.now());
-      setTimeout(pollLive, wait);      
+      setTimeout(pollLive, wait);
     }
 
     let chartsTimer = null;
@@ -1143,11 +1123,9 @@
       chartsBusy = true;
       try {
         if (full || !hist.length) {
-          // полные сутки: сервер отдаёт не больше 900 точек (при плотных
-          // данных — равномерно прореженных, с сохранением пиков CO2/H)
+
           hist = await api('/api/history?hours=' + TOTAL_HOURS);
         } else {
-          // догружаем только новые минутные точки
           const since = hist.length ? hist[hist.length - 1].ts : 0;
           const add = await api('/api/history?since=' + since);
           if (add && add.length) hist = hist.concat(add);
@@ -1257,13 +1235,10 @@
         const txt = await r.text();
         if (!r.ok) { alert(txt); return; }
         loadData();
-
-        // 2️⃣ Очищаем кэш точек графика (все данные, включая удалённые)
         hist = [];
-        markDirty(); // помечаем, что графика нужно перерисовать
+        markDirty();
 
-        // Если нужен мгновенный пересчёт (один запрос к серверу, без flash):
-        // loadCharts(true);
+
       } catch (e) { alert('Ошибка удаления'); }
     }
 
@@ -1308,9 +1283,9 @@
         } else if (co2 > 0) {
           linkTxt = 'OK';
         } else if (s.mhzReady) {
-          linkTxt = 'нет связи';   // датчик уже отвечал, но сейчас молчит = отвал
+          linkTxt = 'нет связи';
         } else {
-          linkTxt = 'ожидание данных'; // прогрева нет, первого чтения ещё не было
+          linkTxt = 'ожидание данных';
         }
         $('calstat').innerHTML =
           `Диапазон: ${s.range} ppm · ABC: ${s.abc === 1 || s.abc === true ? 'вкл' : 'выкл'} · CO₂ сейчас: ${co2Txt} · Связь: ${linkTxt}`;
@@ -1327,13 +1302,10 @@
         await new Promise(res => setTimeout(res, 300));
       }
       alert(msg); loadData();
-
-      // 2️⃣ Очищаем массив точек графика
       hist = [];
-      markDirty(); // перерисовка при следующем опросе
+      markDirty();
 
-      // Если нужен мгновенный пересчёт (один запрос к серверу, без flash):
-      // loadCharts(true);
+
     }
 
     async function loadSettings() {
@@ -1370,18 +1342,14 @@
       return h >= 24 ? (' · ' + Math.round(h / 24) + ' сут') : (' · ' + Math.round(h) + ' ч');
     }
     function updateLogBadge() {
-      // Файлы и ОЗУ пересекаются (preload кладёт файлы в кольцо), поэтому не
-      // суммируем: показываем оценку объёма, а разбивку — в title.
+
       $('logBadge').textContent = 'Записей: ' + Math.max(statsFiles, statsRam) + logSpan();
       $('logBadge').title = 'В файлах: ' + statsFiles + ' · в ОЗУ: ' + statsRam + ' · на графике: ' + hist.length;
     }
     window.addEventListener('resize', () => { markDirty(); drawAll(); });
 
-    // Каждый график прокручивается независимо — общего scroll-обработчика нет.
-    // Оставляем только защиту от перехвата жеста свайпом вкладок.
     document.querySelectorAll('.chart-scroll').forEach(el => {
       el.addEventListener('touchstart', (e) => {
-        // Не давать свайпу вкладок перехватить жест прокрутки графика
         if (e.touches && e.touches.length === 1) {
           swTrack = false; swEl = null;
         }

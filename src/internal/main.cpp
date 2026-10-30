@@ -90,7 +90,8 @@ struct Reading {
 };
 
 Reading  latest;
-bool     dhtOk = false, mhzOk = false;
+bool     dhtOk             = false;
+bool     mhzOk             = false;
 bool     mhzFirstReadDone  = false;
 bool     mhzHeating        = true;
 bool     mdnsStarted       = false;
